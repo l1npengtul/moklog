@@ -7,20 +7,29 @@ pub struct Config {
     pub admin_key: String,
     pub git: String,
     pub branch: String,
+    pub default_timezone: i32,
+    pub sitename: String,
+    pub srv_large_subdomain: bool,
 }
 
 impl Config {
-    pub fn new() -> Result<()> {
+    pub fn new() -> Result<Config> {
         let postgres = var("POSTGRES_URL")?;
         let admin_key = var("SECRET")?;
         let git = var("GIT_URL")?;
         let branch = var("GIT_BRANCH")?;
+        let default_timezone = var("TIMEZONE_DEFAULT")?.parse::<i32>()?;
+        let sitename = var("SITENAME")?;
+        let srv_large_subdomain = var("SRV_FROM_SUBDOMAIN")?.parse::<bool>()?;
 
         Ok(Config {
             postgres,
             admin_key,
             git,
             branch,
+            default_timezone,
+            sitename,
+            srv_large_subdomain,
         })
     }
 
@@ -38,5 +47,16 @@ impl Config {
 
     pub fn branch(&self) -> &str {
         &self.branch
+    }
+
+    pub fn default_timezone(&self) -> i32 {
+        self.default_timezone
+    }
+
+    pub fn sitename(&self) -> &str {
+        &self.sitename
+    }
+    pub fn srv_large_subdomain(&self) -> bool {
+        self.srv_large_subdomain
     }
 }
