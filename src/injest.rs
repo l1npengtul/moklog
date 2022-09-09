@@ -51,16 +51,7 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
         .await?;
 
     let mut templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
-    let mut pages = HashMap::new();
-    for pgcat in walker_with_ignores(SITE_CONTENT) {
-        let page = match pgcat {
-            Ok(v) => v,
-            Err(why) => {
-                warn!("Skipping file: {}", why);
-                continue;
-            }
-        };
-    }
+    let mut pages = {};
 
     Err(())
 }

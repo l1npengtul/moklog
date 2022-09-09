@@ -49,3 +49,6 @@ version = "0.25"
 [dependencies.pulldown-cmark]
 version = "0.9"
 features = ["serde", "simd", "getopts"]
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.5"

@@ -7,6 +7,13 @@ use moka::future::Cache;
 use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex;
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 mod config;
 mod injest;
 mod models;
