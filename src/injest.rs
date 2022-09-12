@@ -1,11 +1,15 @@
 use crate::{models::*, State, SITE_CONTENT};
+use bytes::Bytes;
 use color_eyre::Result;
 use ignore::{DirEntry, Error, Walk, WalkBuilder};
+use pathdiff::diff_paths;
 use sea_orm::EntityTrait;
 use std::collections::HashMap;
 use std::fs::FileType;
+use std::path::PathBuf;
 use std::{path::Path, sync::Arc};
-use tokio::fs::File;
+use tantivy::HasLen;
+use tokio::fs::{canonicalize, File};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::spawn_blocking;
@@ -22,6 +26,7 @@ pub async fn pull_git(state: Arc<State>) -> Result<()> {
             .arg(state.config.branch())
             .arg(state.config.git())
             .arg(SITE_CONTENT)
+            .arg("--recursive")
             .spawn()?
             .wait()
             .await?;
@@ -35,10 +40,14 @@ pub enum SiteContentDiffElem {
     Added(u64),
 }
 
+enum FileToProcess {
+    Raw(PathBuf),
+    Process(PathBuf),
+}
+
 pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDiffElem>> {
     // explore the whole site
     // first get all the names
-    let db_downloads = downloads::Entity::find().all(&state.database).await?;
     let db_pages = pages::Entity::find().all(&state.database).await?;
     let db_raw_pages = raw_pages::Entity::find().all(&state.database).await?;
     let db_staticses = statics::Entity::find().all(&state.database).await?;
@@ -51,7 +60,38 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
         .await?;
 
     let mut templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
-    let mut pages = {};
+
+    let mut pages = HashMap::new();
+    let mut series = HashMap::new();
+    let mut static_fies = HashMap::new();
+
+    let site_content_dir_path = canonicalize(SITE_CONTENT).await?;
+
+    for item in walker_with_ignores(SITE_CONTENT) {
+        let file = match item {
+            Ok(f) => f,
+            Err(why) => {
+                warn!("Skipping file <unknown>: {}", why);
+                continue;
+            }
+        };
+
+        // get category of file
+        let mut relative_dir_path = match diff_paths(file.path(), &site_content_dir_path) {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "Skipping file {:?}: Failed to construct pathdiff",
+                    file.path()
+                );
+                continue;
+            }
+        };
+
+        // match the file extension
+        match 
+        // we only process markdown
+    }
 
     Err(())
 }
@@ -59,9 +99,7 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
 #[derive(Clone, Debug, PartialEq)]
 struct FileStruct {
     pub name: String,
-    pub file_type: Option<FileType>,
-    pub content: String,
-    pub hash: u64,
+    pub path: PathBuf,
 }
 
 async fn walk_subdirectory(dir: impl AsRef<Path>) -> Result<Vec<FileStruct>> {
@@ -75,32 +113,10 @@ async fn walk_subdirectory(dir: impl AsRef<Path>) -> Result<Vec<FileStruct>> {
             }
         };
 
-        let mut content = String::new();
-        File::open(file.path())
-            .await?
-            .read_to_string(&mut content)
-            .await?;
-
-        let (content, hash) = match spawn_blocking(move || {
-            let ccc = content;
-            let hash = seahash::hash(ccc.as_bytes());
-            (ccc, hash)
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(why) => {
-                warn!("Skipping file: {}", why);
-                continue;
-            }
-        };
-
         info!("Processed File: {:?}", file.path());
         files.push(FileStruct {
             name: file.file_name().to_string_lossy().to_string(),
-            file_type: file.file_type(),
-            content,
-            hash,
+            path: file.into_path(),
         })
     }
     Ok(files)

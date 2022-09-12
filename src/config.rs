@@ -9,7 +9,6 @@ pub struct Config {
     pub branch: String,
     pub default_timezone: i32,
     pub sitename: String,
-    pub srv_large_subdomain: bool,
 }
 
 impl Config {
@@ -20,7 +19,6 @@ impl Config {
         let branch = var("GIT_BRANCH")?;
         let default_timezone = var("TIMEZONE_DEFAULT")?.parse::<i32>()?;
         let sitename = var("SITENAME")?;
-        let srv_large_subdomain = var("SRV_FROM_SUBDOMAIN")?.parse::<bool>()?;
 
         Ok(Config {
             postgres,
@@ -29,7 +27,6 @@ impl Config {
             branch,
             default_timezone,
             sitename,
-            srv_large_subdomain,
         })
     }
 

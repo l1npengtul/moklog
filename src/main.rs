@@ -19,6 +19,7 @@ mod injest;
 mod models;
 
 pub const SITE_CONTENT: &str = "sitecontents";
+pub const SERVE_DIR: &str = "srv";
 
 pub struct State {
     pub database: DatabaseConnection,
