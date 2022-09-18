@@ -1,10 +1,11 @@
 use crate::{models::*, State, SITE_CONTENT};
 use bytes::Bytes;
-use color_eyre::Result;
+use color_eyre::{Report, Result};
 use ignore::{DirEntry, Error, Walk, WalkBuilder};
 use pathdiff::diff_paths;
 use sea_orm::EntityTrait;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::FileType;
 use std::path::PathBuf;
 use std::{path::Path, sync::Arc};
@@ -45,6 +46,12 @@ enum FileToProcess {
     Process(PathBuf),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct FileStruct {
+    pub name: String,
+    pub path: PathBuf,
+}
+
 pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDiffElem>> {
     // explore the whole site
     // first get all the names
@@ -61,9 +68,10 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
 
     let mut templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
 
-    let mut pages = HashMap::new();
-    let mut series = HashMap::new();
-    let mut static_fies = HashMap::new();
+    let mut pages: HashMap<String, HashMap<u64, FileToProcess>> = HashMap::new();
+    let mut series: HashMap<String, HashMap<u64, FileToProcess>> = HashMap::new();
+    let mut static_files_img = HashMap::new();
+    let mut static_files_web = HashMap::new();
 
     let site_content_dir_path = canonicalize(SITE_CONTENT).await?;
 
@@ -76,7 +84,19 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
             }
         };
 
-        // get category of file
+        let extension = if let Some(e) = file.path().extension() {
+            match e.to_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    warn!("Skipping file {:?}: Bad file extension", file.path());
+                    continue;
+                }
+            }
+        } else {
+            warn!("Skipping file {:?}: No file extension", file.path());
+            continue;
+        };
+
         let mut relative_dir_path = match diff_paths(file.path(), &site_content_dir_path) {
             Some(p) => p,
             None => {
@@ -88,18 +108,72 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
             }
         };
 
-        // match the file extension
-        match 
-        // we only process markdown
+        let file_path_depth = relative_dir_path.iter().count() - 1;
+
+        let hash = match hash_file(file.path()).await {
+            Ok(h) => h,
+            Err(why) => {
+                warn!(
+                    "Skipping file {:?}: Failed to construct file hash: {why:?}",
+                    file.path()
+                );
+                continue;
+            }
+        };
+
+        match extension.as_str() {
+            "md" => {
+                // get the category
+                // 1 => just an article
+                // 2 => a series :pog:
+                // more => owo wtf is this???????
+
+                if file_path_depth == 1 {
+                    let category = match relative_dir_path.iter().nth(0) {
+                        Some(c) => match c.to_str() {
+                            Some(v) => v.to_string(),
+                            None => {
+                                warn!("Skipping file {:?}: Bad category", file.path());
+                                continue;
+                            }
+                        },
+                        None => {
+                            warn!("Skipping file {:?}: No category", file.path());
+                            continue;
+                        }
+                    };
+
+                    match pages.get_mut(&category) {
+                        Some(p) => p.insert(hash, FileToProcess::Process(file.into_path())),
+                        None => pages.insert(),
+                    }
+                }
+            }
+            "html" => {}
+            "css" | "js" => {}
+            "sass" => {}
+            "png" | "jpg" | "jpeg" | "gif" => {}
+            ext => {
+                // TODO: Custom file handler plugins here
+                warn!(
+                    "Skipping file {:?}: Unknown file extension {ext}",
+                    file.path()
+                );
+                continue;
+            }
+        }
     }
 
     Err(())
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct FileStruct {
-    pub name: String,
-    pub path: PathBuf,
+async fn hash_file(file: impl AsRef<Path>) -> Result<u64> {
+    let mut file_bin = Vec::new();
+    File::open(file).await?.read_to_end(&mut file_bin).await?;
+    match spawn_blocking(move || seahash::hash(&file_bin)).await {
+        Ok(u) => Ok(u),
+        Err(why) => Err(Report::new(why)),
+    }
 }
 
 async fn walk_subdirectory(dir: impl AsRef<Path>) -> Result<Vec<FileStruct>> {
