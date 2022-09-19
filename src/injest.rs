@@ -47,6 +47,14 @@ enum FileToProcess {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct ProcFile {
+    pub path: PathBuf,
+    pub depth: usize,
+    pub category: Option<String>,
+    pub subcategory: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct FileStruct {
     pub name: String,
     pub path: PathBuf,
@@ -144,9 +152,20 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
                     };
 
                     match pages.get_mut(&category) {
-                        Some(p) => p.insert(hash, FileToProcess::Process(file.into_path())),
-                        None => pages.insert(),
+                        Some(p) => {
+                            p.insert(hash, FileToProcess::Process(file.into_path()));
+                            continue;
+                        }
+                        None => {
+                            pages.insert(category, {
+                                let mut f = HashMap::new();
+                                f.insert(hash, FileToProcess::Process(file.into_path()));
+                                f
+                            });
+                            continue;
+                        }
                     }
+                } else if file_path_depth == 2 {
                 }
             }
             "html" => {}
