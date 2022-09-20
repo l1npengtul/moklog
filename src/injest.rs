@@ -7,6 +7,7 @@ use sea_orm::EntityTrait;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::FileType;
+use std::io::Read;
 use std::path::PathBuf;
 use std::{path::Path, sync::Arc};
 use tantivy::HasLen;
@@ -41,15 +42,10 @@ pub enum SiteContentDiffElem {
     Added(u64),
 }
 
-enum FileToProcess {
-    Raw(PathBuf),
-    Process(PathBuf),
-}
-
 #[derive(Clone, Debug, PartialEq)]
-struct ProcFile {
+struct RegisteredFile {
     pub path: PathBuf,
-    pub depth: usize,
+    pub extension: Option<String>,
     pub category: Option<String>,
     pub subcategory: Option<String>,
 }
@@ -75,11 +71,8 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
         .await?;
 
     let mut templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
-
-    let mut pages: HashMap<String, HashMap<u64, FileToProcess>> = HashMap::new();
-    let mut series: HashMap<String, HashMap<u64, FileToProcess>> = HashMap::new();
-    let mut static_files_img = HashMap::new();
-    let mut static_files_web = HashMap::new();
+    let mut processed_templates = Vec::new();
+    let mut items = Vec::new();
 
     let site_content_dir_path = canonicalize(SITE_CONTENT).await?;
 
@@ -129,59 +122,89 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
             }
         };
 
-        match extension.as_str() {
-            "md" => {
-                // get the category
-                // 1 => just an article
-                // 2 => a series :pog:
-                // more => owo wtf is this???????
+        let category = relative_dir_path
+            .iter()
+            .nth(0)
+            .map(|ostr| ostr.to_str())
+            .flatten()
+            .map(ToString::to_string);
+        let subcategory = relative_dir_path
+            .iter()
+            .nth(1)
+            .map(|ostr| ostr.to_str())
+            .flatten()
+            .map(ToString::to_string);
+        let extension = file
+            .into_path()
+            .extension()
+            .map(|ostr| ostr.to_str())
+            .flatten()
+            .map(ToString::to_string);
 
-                if file_path_depth == 1 {
-                    let category = match relative_dir_path.iter().nth(0) {
-                        Some(c) => match c.to_str() {
-                            Some(v) => v.to_string(),
-                            None => {
-                                warn!("Skipping file {:?}: Bad category", file.path());
-                                continue;
-                            }
-                        },
-                        None => {
-                            warn!("Skipping file {:?}: No category", file.path());
-                            continue;
-                        }
-                    };
+        items.push(RegisteredFile {
+            path: relative_dir_path,
+            extension,
+            category,
+            subcategory,
+        });
 
-                    match pages.get_mut(&category) {
-                        Some(p) => {
-                            p.insert(hash, FileToProcess::Process(file.into_path()));
-                            continue;
-                        }
-                        None => {
-                            pages.insert(category, {
-                                let mut f = HashMap::new();
-                                f.insert(hash, FileToProcess::Process(file.into_path()));
-                                f
-                            });
-                            continue;
-                        }
-                    }
-                } else if file_path_depth == 2 {
-                }
-            }
-            "html" => {}
-            "css" | "js" => {}
-            "sass" => {}
-            "png" | "jpg" | "jpeg" | "gif" => {}
-            ext => {
-                // TODO: Custom file handler plugins here
-                warn!(
-                    "Skipping file {:?}: Unknown file extension {ext}",
-                    file.path()
-                );
-                continue;
-            }
-        }
+        // match extension.as_str() {
+        //     "md" => {
+        //         // get the category
+        //         // 1 => just an article
+        //         // 2 => a series :pog:
+        //         // more => owo wtf is this???????
+        //
+        //         if file_path_depth == 1 {
+        //
+        //         } else if file_path_depth == 2 {
+        //         }
+        //     }
+        //     "html" => {}
+        //     "css" | "js" => {}
+        //     "sass" => {}
+        //     "png" | "jpg" | "jpeg" | "gif" => {}
+        //     ext => {
+        //         // TODO: Custom file handler plugins here
+        //         warn!(
+        //             "Skipping file {:?}: Unknown file extension {ext}",
+        //             file.path()
+        //         );
+        //         continue;
+        //     }
+        // }
     }
+
+    items.into_iter().for_each(|f| {
+        if f.extension.is_none() {
+            return;
+        }
+
+        let mut read_file = match std::fs::File::open(&f.path) {
+            Ok(file) => file,
+            Err(why) => {
+                warn!("Skipping file {:?}: {:?}", &f.path, why);
+                return;
+            }
+        };
+
+        match f.extension.unwrap().as_str() {
+            "md" => {
+                // read string
+                let mut file_contents = String::new();
+                if let Err(why) = read_file.read_to_string(&mut file_contents) {
+                    warn!("Skipping file {:?}: {:?}", f.path, why);
+                    return;
+                }
+                // read header TOML
+                let split_twice = file_contents.splitn(2, "+++");
+            }
+            "js" | "css" | "html" => {}
+            "sass" => {}
+            "png" | "jpg" | "jpeg" | "gif" | "webp" => {}
+            other_ext => {}
+        }
+    });
 
     Err(())
 }
