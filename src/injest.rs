@@ -1,16 +1,14 @@
 use crate::{models::*, State, SITE_CONTENT};
-use bytes::Bytes;
+use chrono::DateTime;
 use color_eyre::{Report, Result};
-use ignore::{DirEntry, Error, Walk, WalkBuilder};
+use ignore::{Walk, WalkBuilder};
+use itertools::Itertools;
 use pathdiff::diff_paths;
 use sea_orm::EntityTrait;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::fs::FileType;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::PathBuf;
 use std::{path::Path, sync::Arc};
-use tantivy::HasLen;
 use tokio::fs::{canonicalize, File};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -54,6 +52,17 @@ struct RegisteredFile {
 struct FileStruct {
     pub name: String,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ArticleMeta {
+    pub date: DateTime,
+    pub tags: Vec<String>,
+    pub category: String,
+    pub author: String,
+    pub title: String,
+    pub slug: String,
+    pub redirects: Vec<String>,
 }
 
 pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDiffElem>> {
@@ -197,7 +206,15 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
                     return;
                 }
                 // read header TOML
-                let split_twice = file_contents.splitn(2, "+++");
+                let split_twice = file_contents.splitn(2, "+++").collect_vec();
+                let header = match split_twice.get(1) {
+                    Some(h) => *h,
+                    None => {
+                        warn!("Skipping file {:?}: Invalid Header", f.path);
+                        return;
+                    }
+                };
+                let contents = split_twice.get(3).copied().unwrap_or("");
             }
             "js" | "css" | "html" => {}
             "sass" => {}
