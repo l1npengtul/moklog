@@ -1,20 +1,38 @@
 use crate::{models::*, State, SITE_CONTENT};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use color_eyre::{Report, Result};
 use ignore::{Walk, WalkBuilder};
 use itertools::Itertools;
+use minify_html::Cfg;
 use pathdiff::diff_paths;
 use sea_orm::EntityTrait;
+use seahash::hash;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
-use std::path::PathBuf;
-use std::{path::Path, sync::Arc};
-use tokio::fs::{canonicalize, File};
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
-use tokio::task::spawn_blocking;
-use tracing::log::warn;
-use tracing::{error, info};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::{
+    fs::{canonicalize, File},
+    io::AsyncReadExt,
+    process::Command,
+};
+use tokio_rayon::spawn;
+use tracing::{info, log::warn};
+
+const MINIFY_SETTINGS: Cfg = Cfg {
+    do_not_minify_doctype: true,
+    ensure_spec_compliant_unquoted_attribute_values: true,
+    keep_closing_tags: false,
+    keep_html_and_head_opening_tags: false,
+    keep_spaces_between_attributes: false,
+    keep_comments: false,
+    minify_css: true,
+    minify_js: true,
+    remove_bangs: true,
+    remove_processing_instructions: true,
+};
 
 pub async fn pull_git(state: Arc<State>) -> Result<()> {
     if Path::new(SITE_CONTENT).is_dir() {
@@ -54,15 +72,22 @@ struct FileStruct {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct Template {
+    pub hash: u64,
+    pub contents: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ArticleMeta {
-    pub date: DateTime,
+    pub date: DateTime<Utc>,
     pub tags: Vec<String>,
     pub category: String,
     pub author: String,
     pub title: String,
     pub slug: String,
     pub redirects: Vec<String>,
+    pub template: Option<String>,
 }
 
 pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDiffElem>> {
@@ -73,17 +98,74 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
     let db_staticses = statics::Entity::find().all(&state.database).await?;
     let db_templateses = templates::Entity::find().all(&state.database).await?;
 
+    let mut pages = Vec::with_capacity(db_pages.len());
+    let mut raw_pages = Vec::with_capacity(db_raw_pages.len());
+    let mut staticses = Vec::with_capacity(db_staticses.len());
+    let mut templateses = Vec::with_capacity(db_templateses.len());
+
     let mut pengignore = String::new();
     File::open(Path::new(&format!("{SITE_CONTENT}/pengignore")))
         .await?
         .read_to_string(&mut pengignore)
         .await?;
 
-    let mut templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
-    let mut processed_templates = Vec::new();
+    let unprocessed_templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
+    let mut processed_templates = HashMap::new();
     let mut items = Vec::new();
 
     let site_content_dir_path = canonicalize(SITE_CONTENT).await?;
+
+    for unprocessed_template in unprocessed_templates {
+        let file_name = match unprocessed_template
+            .path
+            .file_name()
+            .map(|x| x.to_str())
+            .flatten()
+        {
+            Some(name) => name.to_string(),
+            None => {
+                return Err(Report::msg(format!(
+                    "Failed to process template {:?}: Bad File Name",
+                    unprocessed_template.path
+                )));
+            }
+        };
+
+        match unprocessed_template
+            .path
+            .extension()
+            .unwrap_or("".as_ref())
+            .to_str()
+            .unwrap_or("")
+        {
+            "html" => {
+                let mut contents = String::new();
+                File::open(unprocessed_template.path)
+                    .await?
+                    .read_to_string(&mut contents)
+                    .await?;
+                let hash = spawn(|| hash(contents.as_bytes())).await;
+                processed_templates.insert(file_name.clone(), Template { hash, contents });
+            }
+            "js" => {
+                let mut data = Vec::new();
+                File::open(unprocessed_template.path)
+                    .await?
+                    .read_to_end(&mut data)
+                    .await?;
+                let mut optimized = Vec::with_capacity(data.len());
+                spawn(|| {
+                    minify_js::minify(data, &mut optimized)
+                        .map_err(|x| Report::msg(format!("{x:?}")))
+                })
+                .await?;
+                let hash = spawn(|| hash(optimized.as_slice())).await;
+            }
+            "sass" => {}
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {}
+            _ => continue,
+        }
+    }
 
     for item in walker_with_ignores(SITE_CONTENT) {
         let file = match item {
@@ -184,55 +266,50 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
         // }
     }
 
-    items.into_iter().for_each(|f| {
+    for f in items {
         if f.extension.is_none() {
-            return;
+            warn!("Skipping file {:?}: No file extension", f.path);
+            continue;
         }
 
-        let mut read_file = match std::fs::File::open(&f.path) {
-            Ok(file) => file,
-            Err(why) => {
-                warn!("Skipping file {:?}: {:?}", &f.path, why);
-                return;
-            }
-        };
+        let mut read_file = File::open(&f.path).await?;
 
         match f.extension.unwrap().as_str() {
             "md" => {
                 // read string
                 let mut file_contents = String::new();
-                if let Err(why) = read_file.read_to_string(&mut file_contents) {
-                    warn!("Skipping file {:?}: {:?}", f.path, why);
-                    return;
+                if let Err(why) = read_file.read_to_string(&mut file_contents).await {
+                    warn!("Skipping file {:?}: {}", f.path, why);
+                    continue;
                 }
                 // read header TOML
                 let split_twice = file_contents.splitn(2, "+++").collect_vec();
-                let header = match split_twice.get(1) {
-                    Some(h) => *h,
-                    None => {
-                        warn!("Skipping file {:?}: Invalid Header", f.path);
-                        return;
+                if split_twice.len() != 4 {
+                    warn!("Skipping file {:?}: Bad split", f.path);
+                    continue;
+                }
+                let header = match toml::from_str::<ArticleMeta>(split_twice.get(1).unwrap()) {
+                    Ok(meta) => meta,
+                    Err(why) => {
+                        warn!("Skipping file {:?}: {}", f.path, why);
+                        continue;
                     }
                 };
                 let contents = split_twice.get(3).copied().unwrap_or("");
             }
             "js" | "css" | "html" => {}
             "sass" => {}
-            "png" | "jpg" | "jpeg" | "gif" | "webp" => {}
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {}
             other_ext => {}
         }
-    });
-
+    }
     Err(())
 }
 
 async fn hash_file(file: impl AsRef<Path>) -> Result<u64> {
     let mut file_bin = Vec::new();
     File::open(file).await?.read_to_end(&mut file_bin).await?;
-    match spawn_blocking(move || seahash::hash(&file_bin)).await {
-        Ok(u) => Ok(u),
-        Err(why) => Err(Report::new(why)),
-    }
+    Ok(spawn(move || hash(&file_bin)).await)
 }
 
 async fn walk_subdirectory(dir: impl AsRef<Path>) -> Result<Vec<FileStruct>> {
