@@ -3,8 +3,13 @@ use chrono::{DateTime, Utc};
 use color_eyre::{Report, Result};
 use ignore::{Walk, WalkBuilder};
 use itertools::Itertools;
+use lightningcss::{
+    printer::PrinterOptions,
+    stylesheet::{ParserOptions, StyleSheet},
+};
 use minify_html::Cfg;
 use pathdiff::diff_paths;
+use rsass::compile_scss;
 use sea_orm::EntityTrait;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
@@ -90,6 +95,30 @@ struct ArticleMeta {
     pub template: Option<String>,
 }
 
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
+pub enum CompiledFileType {
+    Html,
+    Js,
+    Css,
+    Scss,
+    RawBinary,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DataType {
+    Direct,
+    Binary(Vec<u8>),
+    String(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessedFile {
+    pub path: PathBuf,
+    pub ftype: CompiledFileType,
+    pub hash: u64,
+    pub data: DataType,
+}
+
 pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDiffElem>> {
     // explore the whole site
     // first get all the names
@@ -161,8 +190,44 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
                 .await?;
                 let hash = spawn(|| hash(optimized.as_slice())).await;
             }
-            "sass" => {}
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {}
+            "css" => {
+                let mut contents = String::new();
+                File::open(unprocessed_template.path)
+                    .await?
+                    .read_to_string(&mut contents)
+                    .await?;
+                let compiled = spawn(|| {
+                    let compiler = StyleSheet::parse(&contents, ParserOptions::default())?;
+                    let result = compiler.to_css(PrinterOptions::default())?;
+                    Ok(result.code)
+                })
+                .await?;
+                let hash = spawn(|| hash(compiled.as_bytes())).await;
+            }
+            "sass" => {
+                let mut contents = Vec::new();
+                File::open(unprocessed_template.path)
+                    .await?
+                    .read_to_end(&mut contents)
+                    .await?;
+                let compiled = spawn(|| {
+                    let compiled_css =
+                        String::from_utf8(compile_scss(&contents, Default::default())?)?;
+                    let compiler = StyleSheet::parse(&compiled_css, ParserOptions::default())?;
+                    let result = compiler.to_css(PrinterOptions::default())?;
+                    Ok(result.code)
+                })
+                .await?;
+                let hash = spawn(|| hash(compiled.as_bytes())).await;
+            }
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {
+                let mut data = Vec::new();
+                File::open(unprocessed_template.path)
+                    .await?
+                    .read_to_end(&mut data)
+                    .await?;
+                let hash = spawn(|| hash(data.as_slice())).await;
+            }
             _ => continue,
         }
     }
@@ -330,6 +395,78 @@ async fn walk_subdirectory(dir: impl AsRef<Path>) -> Result<Vec<FileStruct>> {
         })
     }
     Ok(files)
+}
+
+async fn process_file(file: impl AsRef<Path>) -> Result<ProcessedFile> {
+    let path = file.as_ref().to_path_buf();
+    let extension = path.extension().map(|x| x.to_str()).flatten().unwrap_or("");
+    match extension {
+        "html" => {
+            let mut contents = String::new();
+            File::open(&path)
+                .await?
+                .read_to_string(&mut contents)
+                .await?;
+            let hash = spawn(|| hash(contents.as_bytes())).await;
+            ProcessedFile {
+                path,
+                ftype: CompiledFileType::Html,
+                hash,
+                data: vec![],
+            }
+        }
+        "js" => {
+            let mut data = Vec::new();
+            File::open(unprocessed_template.path)
+                .await?
+                .read_to_end(&mut data)
+                .await?;
+            let mut optimized = Vec::with_capacity(data.len());
+            spawn(|| {
+                minify_js::minify(data, &mut optimized).map_err(|x| Report::msg(format!("{x:?}")))
+            })
+            .await?;
+            let hash = spawn(|| hash(optimized.as_slice())).await;
+        }
+        "css" => {
+            let mut contents = String::new();
+            File::open(unprocessed_template.path)
+                .await?
+                .read_to_string(&mut contents)
+                .await?;
+            let compiled = spawn(|| {
+                let compiler = StyleSheet::parse(&contents, ParserOptions::default())?;
+                let result = compiler.to_css(PrinterOptions::default())?;
+                Ok(result.code)
+            })
+            .await?;
+            let hash = spawn(|| hash(compiled.as_bytes())).await;
+        }
+        "sass" => {
+            let mut contents = Vec::new();
+            File::open(unprocessed_template.path)
+                .await?
+                .read_to_end(&mut contents)
+                .await?;
+            let compiled = spawn(|| {
+                let compiled_css = String::from_utf8(compile_scss(&contents, Default::default())?)?;
+                let compiler = StyleSheet::parse(&compiled_css, ParserOptions::default())?;
+                let result = compiler.to_css(PrinterOptions::default())?;
+                Ok(result.code)
+            })
+            .await?;
+            let hash = spawn(|| hash(compiled.as_bytes())).await;
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {
+            let mut data = Vec::new();
+            File::open(unprocessed_template.path)
+                .await?
+                .read_to_end(&mut data)
+                .await?;
+            let hash = spawn(|| hash(data.as_slice())).await;
+        }
+        _ => continue,
+    }
 }
 
 fn walker_with_ignores(path: impl AsRef<Path>) -> Walk {
