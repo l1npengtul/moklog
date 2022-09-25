@@ -9,6 +9,7 @@ pub struct Config {
     pub branch: String,
     pub default_timezone: i32,
     pub sitename: String,
+    pub index_dir: String,
 }
 
 impl Config {
@@ -19,6 +20,7 @@ impl Config {
         let branch = var("GIT_BRANCH")?;
         let default_timezone = var("TIMEZONE_DEFAULT")?.parse::<i32>()?;
         let sitename = var("SITENAME")?;
+        let index_dir = var("INDEX")?;
 
         Ok(Config {
             postgres,
@@ -27,6 +29,7 @@ impl Config {
             branch,
             default_timezone,
             sitename,
+            index_dir
         })
     }
 

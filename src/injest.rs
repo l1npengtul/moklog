@@ -7,19 +7,27 @@ use lightningcss::{
     printer::PrinterOptions,
     stylesheet::{ParserOptions, StyleSheet},
 };
+use markdown_toc::Heading;
 use minify_html::Cfg;
 use pathdiff::diff_paths;
+use pulldown_cmark::{html::push_html, Options, Parser};
 use rsass::compile_scss;
 use sea_orm::EntityTrait;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
 };
+use tantivy::{
+    schema::{Schema, STORED, TEXT},
+    Index,
+};
+use tera::{Context, Tera};
 use tokio::{
-    fs::{canonicalize, File},
+    fs::{canonicalize, remove_dir_all, DirBuilder, File},
     io::AsyncReadExt,
     process::Command,
 };
@@ -85,14 +93,15 @@ struct Template {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ArticleMeta {
+    pub title: String,
     pub date: DateTime<Utc>,
     pub tags: Vec<String>,
     pub category: String,
     pub author: String,
-    pub title: String,
     pub slug: String,
     pub redirects: Vec<String>,
     pub template: Option<String>,
+    pub generate_toc: bool,
 }
 
 #[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
@@ -119,6 +128,9 @@ pub struct ProcessedFile {
     pub data: DataType,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessedArticle {}
+
 pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDiffElem>> {
     // explore the whole site
     // first get all the names
@@ -138,11 +150,16 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
         .read_to_string(&mut pengignore)
         .await?;
 
-    let unprocessed_templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
-    let mut processed_templates = HashMap::new();
+    let mut unprocessed_templates = walk_subdirectory(format!("{SITE_CONTENT}/templates")).await?;
+    let mut processed_templates = HashSet::new();
     let mut items = Vec::new();
 
+    let mut color_scheme = None;
+
     let site_content_dir_path = canonicalize(SITE_CONTENT).await?;
+
+    let mut site_content_dir_path_template = canonicalize(SITE_CONTENT).await?;
+    site_content_dir_path_template.push("templates");
 
     for unprocessed_template in unprocessed_templates {
         let file_name = match unprocessed_template
@@ -160,75 +177,40 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
             }
         };
 
-        match unprocessed_template
-            .path
+        let mut relative_file_path =
+            match diff_paths(&unprocessed_template.path, &site_content_dir_path_template) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "Skipping file {:?}: Failed to construct pathdiff",
+                        &unprocessed_template.path
+                    );
+                    continue;
+                }
+            };
+
+        let extension = relative_file_path
             .extension()
-            .unwrap_or("".as_ref())
-            .to_str()
-            .unwrap_or("")
-        {
-            "html" => {
-                let mut contents = String::new();
-                File::open(unprocessed_template.path)
-                    .await?
-                    .read_to_string(&mut contents)
-                    .await?;
-                let hash = spawn(|| hash(contents.as_bytes())).await;
-                processed_templates.insert(file_name.clone(), Template { hash, contents });
+            .map(|x| x.to_str())
+            .flatten()
+            .unwrap_or("");
+
+        match extension {
+            "" => {}
+        }
+
+        let processed_file = process_file(relative_file_path).await?;
+
+        match processed_file.ftype {
+            CompiledFileType::Html => {
+                let path_as_str = relative_file_path.to_string_lossy().to_string();
+                if !processed_templates.insert(path_as_str) {
+                    warn!("Overwriting template {}: Already Exists", path_as_str);
+                }
             }
-            "js" => {
-                let mut data = Vec::new();
-                File::open(unprocessed_template.path)
-                    .await?
-                    .read_to_end(&mut data)
-                    .await?;
-                let mut optimized = Vec::with_capacity(data.len());
-                spawn(|| {
-                    minify_js::minify(data, &mut optimized)
-                        .map_err(|x| Report::msg(format!("{x:?}")))
-                })
-                .await?;
-                let hash = spawn(|| hash(optimized.as_slice())).await;
+            _ => {
+                staticses.push(processed_file);
             }
-            "css" => {
-                let mut contents = String::new();
-                File::open(unprocessed_template.path)
-                    .await?
-                    .read_to_string(&mut contents)
-                    .await?;
-                let compiled = spawn(|| {
-                    let compiler = StyleSheet::parse(&contents, ParserOptions::default())?;
-                    let result = compiler.to_css(PrinterOptions::default())?;
-                    Ok(result.code)
-                })
-                .await?;
-                let hash = spawn(|| hash(compiled.as_bytes())).await;
-            }
-            "sass" => {
-                let mut contents = Vec::new();
-                File::open(unprocessed_template.path)
-                    .await?
-                    .read_to_end(&mut contents)
-                    .await?;
-                let compiled = spawn(|| {
-                    let compiled_css =
-                        String::from_utf8(compile_scss(&contents, Default::default())?)?;
-                    let compiler = StyleSheet::parse(&compiled_css, ParserOptions::default())?;
-                    let result = compiler.to_css(PrinterOptions::default())?;
-                    Ok(result.code)
-                })
-                .await?;
-                let hash = spawn(|| hash(compiled.as_bytes())).await;
-            }
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {
-                let mut data = Vec::new();
-                File::open(unprocessed_template.path)
-                    .await?
-                    .read_to_end(&mut data)
-                    .await?;
-                let hash = spawn(|| hash(data.as_slice())).await;
-            }
-            _ => continue,
         }
     }
 
@@ -303,33 +285,24 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
             category,
             subcategory,
         });
-
-        // match extension.as_str() {
-        //     "md" => {
-        //         // get the category
-        //         // 1 => just an article
-        //         // 2 => a series :pog:
-        //         // more => owo wtf is this???????
-        //
-        //         if file_path_depth == 1 {
-        //
-        //         } else if file_path_depth == 2 {
-        //         }
-        //     }
-        //     "html" => {}
-        //     "css" | "js" => {}
-        //     "sass" => {}
-        //     "png" | "jpg" | "jpeg" | "gif" => {}
-        //     ext => {
-        //         // TODO: Custom file handler plugins here
-        //         warn!(
-        //             "Skipping file {:?}: Unknown file extension {ext}",
-        //             file.path()
-        //         );
-        //         continue;
-        //     }
-        // }
     }
+
+    let mut templater = Tera::default();
+    let mut processed_articles = Vec::new();
+
+    let mut schema = Schema::builder();
+    let title = schema.add_text_field("title", TEXT | STORED);
+    let author = schema.add_text_field("author", TEXT | STORED);
+    let category = schema.add_text_field("category", TEXT | STORED);
+    let tags = schema.add_json_field("tags", STORED);
+    let date = schema.add_date_field("tags", STORED);
+    let body = schema.add_text_field("body", TEXT);
+    let schema = schema.build();
+
+    let indx_dir = state.config.index_dir.clone();
+    let _ = remove_dir_all(&indx_dir).await;
+    DirBuilder::new().recursive(true).create(&indx_dir).await?;
+    let mut indexer = spawn(move || Index::create_in_dir(indx_dir, schema)).await?;
 
     for f in items {
         if f.extension.is_none() {
@@ -347,12 +320,14 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
                     warn!("Skipping file {:?}: {}", f.path, why);
                     continue;
                 }
+
                 // read header TOML
                 let split_twice = file_contents.splitn(2, "+++").collect_vec();
                 if split_twice.len() != 4 {
                     warn!("Skipping file {:?}: Bad split", f.path);
                     continue;
                 }
+
                 let header = match toml::from_str::<ArticleMeta>(split_twice.get(1).unwrap()) {
                     Ok(meta) => meta,
                     Err(why) => {
@@ -360,7 +335,118 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
                         continue;
                     }
                 };
+
+                // get md contents
                 let contents = split_twice.get(3).copied().unwrap_or("");
+                let mut fence = None;
+                let mut toc_cfg = markdown_toc::Config::default();
+                toc_cfg.bullet = "-".to_string();
+                // generate table of contents
+                let table_of_contents = contents
+                    .lines()
+                    .filter(|line| match fence {
+                        Some(tag) => {
+                            if line.starts_with(tag) {
+                                fence = None;
+                            }
+                            false
+                        }
+                        None => {
+                            if line.starts_with("```") {
+                                fence = Some("```");
+                                false
+                            } else if line.starts_with("~~~") {
+                                fence = Some("~~~");
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                    })
+                    .map(Heading::from_str)
+                    .filter_map(Result::ok)
+                    .filter_map(|heading| heading.format(&toc_cfg))
+                    .join("\n");
+
+                // render to HTML
+                let mut options = Options::empty();
+                options.insert(Options::ENABLE_FOOTNOTES);
+                options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+                options.insert(Options::ENABLE_STRIKETHROUGH);
+                options.insert(Options::ENABLE_SMART_PUNCTUATION);
+                options.insert(Options::ENABLE_TABLES);
+
+                let mut page_contents_rendered = spawn(|| {
+                    let md_contents = Parser::new_ext(contents, options);
+                    let mut contents = String::new();
+                    push_html(&mut contents, md_contents);
+                    contents
+                })
+                .await;
+
+                let mut table_of_contents_rendered = spawn(|| {
+                    let md_toc = Parser::new_ext(&table_of_contents, options);
+                    let mut contents = String::new();
+                    push_html(&mut contents, md_toc);
+                    contents
+                })
+                .await;
+
+                // set content
+                let mut tera_context = Context::new();
+                tera_context.insert("page.title", &header.title);
+                tera_context.insert("page.date", &header.date);
+                tera_context.insert("page.author", &header.author);
+                tera_context.insert("page.category", &header.category);
+                tera_context.insert("page.tags", &header.tags);
+                tera_context.insert("page.redirects", &header.redirects);
+                tera_context.insert("page.slug", &header.slug);
+                tera_context.insert("page.do_generate_toc", &header.generate_toc);
+                tera_context.insert("page.table_of_contents", &table_of_contents_rendered);
+                tera_context.insert("page.content", &page_contents_rendered);
+
+                // get template
+                let template_key = match header.template {
+                    Some(t) => t,
+                    None => {
+                        // get the category
+                        let mut intemideraty = match f.category {
+                            Some(c) => c,
+                            None => match f.path.file_name() {
+                                Some(os) => os.to_string_lossy().to_string(),
+                                None => {
+                                    warn!("Skipping File {:?}: Could not find template.", f.path);
+                                    continue;
+                                }
+                            },
+                        };
+                        intemideraty += ".html";
+                        intemideraty
+                    }
+                };
+                let template = match processed_templates.get(&template_key) {
+                    None => {
+                        warn!("Skipping File {:?}: Could not find template.", f.path);
+                        continue;
+                    }
+                    Some(t) => t,
+                };
+
+                if let Err(why) = templater.add_template_file(template, Some(&template_key)) {
+                    warn!(
+                        "Skipping File {:?}: Could add template {} due to {}.",
+                        f.path, template, why
+                    );
+                    continue;
+                }
+
+                let rendered = match templater.render(&template_key, &tera_context) {
+                    Ok(r) => r,
+                    Err(why) => {
+                        warn!("Skipping File {:?}: {}", f.path, why);
+                        continue;
+                    }
+                };
             }
             "js" | "css" | "html" => {}
             "sass" => {}
@@ -400,73 +486,103 @@ async fn walk_subdirectory(dir: impl AsRef<Path>) -> Result<Vec<FileStruct>> {
 async fn process_file(file: impl AsRef<Path>) -> Result<ProcessedFile> {
     let path = file.as_ref().to_path_buf();
     let extension = path.extension().map(|x| x.to_str()).flatten().unwrap_or("");
-    match extension {
+
+    let processed = match extension {
         "html" => {
             let mut contents = String::new();
             File::open(&path)
                 .await?
                 .read_to_string(&mut contents)
                 .await?;
-            let hash = spawn(|| hash(contents.as_bytes())).await;
+            let hclone = contents.clone();
+            let hash = spawn(move || hash(hclone.as_bytes())).await;
+
             ProcessedFile {
                 path,
                 ftype: CompiledFileType::Html,
                 hash,
-                data: vec![],
+                data: DataType::String(contents),
             }
         }
         "js" => {
             let mut data = Vec::new();
-            File::open(unprocessed_template.path)
-                .await?
-                .read_to_end(&mut data)
-                .await?;
-            let mut optimized = Vec::with_capacity(data.len());
-            spawn(|| {
-                minify_js::minify(data, &mut optimized).map_err(|x| Report::msg(format!("{x:?}")))
+            File::open(&path).await?.read_to_end(&mut data).await?;
+            let compiled = spawn(|| -> Result<Vec<u8>> {
+                let mut optimized = Vec::with_capacity(data.len());
+                minify_js::minify(data, &mut optimized)
+                    .map_err(|x| Report::msg(format!("{x:?}")))?;
+                Ok(optimized)
             })
             .await?;
-            let hash = spawn(|| hash(optimized.as_slice())).await;
+            let hclone = compiled.clone();
+            let hash = spawn(move || hash(hclone.as_slice())).await;
+
+            ProcessedFile {
+                path,
+                ftype: CompiledFileType::Js,
+                hash,
+                data: DataType::Binary(compiled),
+            }
         }
         "css" => {
             let mut contents = String::new();
-            File::open(unprocessed_template.path)
+            File::open(&path)
                 .await?
                 .read_to_string(&mut contents)
                 .await?;
-            let compiled = spawn(|| {
-                let compiler = StyleSheet::parse(&contents, ParserOptions::default())?;
+            let compiled = spawn(move || -> Result<String> {
+                let compiler = StyleSheet::parse(contents.as_str(), ParserOptions::default())
+                    .map_err(|why| Report::msg(why.to_string()))?;
                 let result = compiler.to_css(PrinterOptions::default())?;
                 Ok(result.code)
             })
             .await?;
-            let hash = spawn(|| hash(compiled.as_bytes())).await;
+            let hclone = compiled.clone();
+            let hash = spawn(move || hash(hclone.as_bytes())).await;
+
+            ProcessedFile {
+                path,
+                ftype: CompiledFileType::Css,
+                hash,
+                data: DataType::String(compiled),
+            }
         }
         "sass" => {
             let mut contents = Vec::new();
-            File::open(unprocessed_template.path)
-                .await?
-                .read_to_end(&mut contents)
-                .await?;
-            let compiled = spawn(|| {
+            File::open(&path).await?.read_to_end(&mut contents).await?;
+            let compiled = spawn(move || -> Result<String> {
                 let compiled_css = String::from_utf8(compile_scss(&contents, Default::default())?)?;
-                let compiler = StyleSheet::parse(&compiled_css, ParserOptions::default())?;
+                let compiler = StyleSheet::parse(compiled_css.as_str(), ParserOptions::default())
+                    .map_err(|why| Report::msg(why.to_string()))?;
                 let result = compiler.to_css(PrinterOptions::default())?;
                 Ok(result.code)
             })
             .await?;
-            let hash = spawn(|| hash(compiled.as_bytes())).await;
+            let hclone = compiled.clone();
+            let hash = spawn(move || hash(hclone.as_bytes())).await;
+
+            ProcessedFile {
+                path,
+                ftype: CompiledFileType::Css,
+                hash,
+                data: DataType::String(compiled),
+            }
         }
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {
             let mut data = Vec::new();
-            File::open(unprocessed_template.path)
-                .await?
-                .read_to_end(&mut data)
-                .await?;
-            let hash = spawn(|| hash(data.as_slice())).await;
+            File::open(&path).await?.read_to_end(&mut data).await?;
+            let hclone = data.clone();
+            let hash = spawn(move || hash(hclone.as_slice())).await;
+            ProcessedFile {
+                path,
+                ftype: CompiledFileType::RawBinary,
+                hash,
+                data: DataType::Binary(data),
+            }
         }
-        _ => continue,
-    }
+        _ => return Err(Report::msg("unknown file format")), // TODO
+    };
+    Ok(processed)
 }
 
 fn walker_with_ignores(path: impl AsRef<Path>) -> Walk {

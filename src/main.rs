@@ -1,5 +1,6 @@
 #![feature(async_iterator)]
 #![feature(async_iter_from_iter)]
+#![feature(arc_unwrap_or_clone)]
 
 use crate::config::Config;
 use axum::body::Bytes;
