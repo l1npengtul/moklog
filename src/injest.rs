@@ -10,17 +10,19 @@ use lightningcss::{
 use markdown_toc::Heading;
 use minify_html::Cfg;
 use pathdiff::diff_paths;
-use pulldown_cmark::{html::push_html, Options, Parser};
+use pulldown_cmark::{html::push_html, CodeBlockKind, Event, Options, Parser, Tag};
 use rsass::compile_scss;
 use sea_orm::EntityTrait;
 use seahash::hash;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    fmt::Write,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
+use syntect::highlighting::Theme;
 use tantivy::{
     schema::{Schema, STORED, TEXT},
     Index,
@@ -110,6 +112,7 @@ pub enum CompiledFileType {
     Js,
     Css,
     Scss,
+    Theme,
     RawBinary,
 }
 
@@ -154,7 +157,7 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
     let mut processed_templates = HashSet::new();
     let mut items = Vec::new();
 
-    let mut color_scheme = None;
+    let mut color_scheme: Option<Theme> = None;
 
     let site_content_dir_path = canonicalize(SITE_CONTENT).await?;
 
@@ -195,10 +198,6 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
             .flatten()
             .unwrap_or("");
 
-        match extension {
-            "" => {}
-        }
-
         let processed_file = process_file(relative_file_path).await?;
 
         match processed_file.ftype {
@@ -207,6 +206,9 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
                 if !processed_templates.insert(path_as_str) {
                     warn!("Overwriting template {}: Already Exists", path_as_str);
                 }
+            }
+            CompiledFileType::Theme => {
+                let parse = quick_xml::de::Deserializer::from_str(&processed_file.data)
             }
             _ => {
                 staticses.push(processed_file);
@@ -367,14 +369,6 @@ pub async fn update_site_content(state: Arc<State>) -> Result<Vec<SiteContentDif
                     .filter_map(Result::ok)
                     .filter_map(|heading| heading.format(&toc_cfg))
                     .join("\n");
-
-                // render to HTML
-                let mut options = Options::empty();
-                options.insert(Options::ENABLE_FOOTNOTES);
-                options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
-                options.insert(Options::ENABLE_STRIKETHROUGH);
-                options.insert(Options::ENABLE_SMART_PUNCTUATION);
-                options.insert(Options::ENABLE_TABLES);
 
                 let mut page_contents_rendered = spawn(|| {
                     let md_contents = Parser::new_ext(contents, options);
@@ -568,6 +562,22 @@ async fn process_file(file: impl AsRef<Path>) -> Result<ProcessedFile> {
                 data: DataType::String(compiled),
             }
         }
+        "tmTheme" => {
+            let mut contents = String::new();
+            File::open(&path)
+                .await?
+                .read_to_string(&mut contents)
+                .await?;
+            let contents_clone = contents.clone();
+            let hash = spawn(move || hash(contents_clone.as_bytes())).await;
+            ProcessedFile {
+                path,
+                ftype: CompiledFileType::Theme,
+                hash,
+                data: DataType::String(contents),
+            }
+
+        }
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "wasm" => {
             let mut data = Vec::new();
             File::open(&path).await?.read_to_end(&mut data).await?;
@@ -594,4 +604,50 @@ fn walker_with_ignores(path: impl AsRef<Path>) -> Walk {
         .add_custom_ignore_filename("downloads")
         .add_custom_ignore_filename("error")
         .build()
+}
+
+fn md_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_SMART_PUNCTUATION);
+    options.insert(Options::ENABLE_TABLES);
+    options
+}
+
+pub fn process_markdown<W: Write>(file: &str, writer: W) -> Result<()> {
+    //
+
+    let parser = Parser::new_ext(file, md_options());
+
+    struct Code {
+        pub language: String,
+        pub block: String,
+    }
+
+    let mut code_block: Option<Code> = None;
+
+    let iter = parser.map(|event| match event {
+        Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) => {
+            code_block = Some(Code {
+                language: lang.to_string(),
+                block: Default::default(),
+            });
+            return Event::Text("".into());
+        }
+        Event::End(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {}
+        Event::Code(code) => {
+            if let Some(mut cb) = code_block {
+                cb.block.push_str(&code);
+                return Event::Html("".into());
+            }
+        }
+        _ => {}
+    });
+}
+
+pub fn highlight_code<W: Write>(out: W, language: Option<&str>, code: &str) -> Result<()> {
+    let language = language.unwrap_or("");
+    let config =
 }

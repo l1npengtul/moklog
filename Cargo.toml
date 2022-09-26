@@ -31,6 +31,7 @@ tokio-rayon = "2.1"
 tera = "1.17"
 markdown-toc = "0.2"
 syntect = "5.0.0"
+lol_html = "0.3"
 
 [dependencies.tokio]
 version = "1.20"
@@ -62,6 +63,10 @@ features = ["serde", "simd", "getopts"]
 [dependencies.chrono]
 version = "0.4"
 features = ["serde"]
+
+[dependencies.quick-xml]
+version = "0.25"
+features = ["serialize"]
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
