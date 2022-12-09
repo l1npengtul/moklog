@@ -1,6 +1,9 @@
+use crate::injest::stylesheet::{compile_sass, optimize_css};
 use color_eyre::{Report, Result};
 use ignore::{Walk, WalkBuilder};
 use itertools::Itertools;
+use memmap2::Mmap;
+use minify_js::TopLevelMode;
 use rhai::Dynamic;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -10,15 +13,17 @@ use syntect::highlighting::{Theme, ThemeSet};
 use tera::Tera;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tracing_subscriber::fmt::format;
 
 pub struct SiteTheme {
+    pub metadata: SiteThemeMetadata,
     pub syntect_colors: ThemeSet,
     pub tera_templates: Tera,
     pub shortcode: HashMap<String, String>,
     pub functions: HashMap<String, String>,
-    pub persistent_function_data: BTreeMap<String, BTreeMap<String, Dynamic>>,
     pub filters: HashMap<String, String>,
-    pub metadata: SiteThemeMetadata,
+    pub styles: HashMap<String, String>,
+    pub js_scripts: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -48,7 +53,7 @@ pub async fn build_site_theme() -> Result<SiteTheme> {
         .await?
         .read_to_string(&mut template_metadata)
         .await?;
-    let template_metadata = toml::from_str::<SiteThemeMetadata>(&template_metadata)?;
+    let metadata = toml::from_str::<SiteThemeMetadata>(&template_metadata)?;
 
     // syntax highlighting
 
@@ -74,7 +79,80 @@ pub async fn build_site_theme() -> Result<SiteTheme> {
     }
     tera_templates.add_template_files(template_files.into_iter())?;
 
-    // compile css
+    // compile scss, css
 
-    Ok(())
+    let mut styles = HashMap::new();
+    for style_entry in make_template_walker!(format!("{TEMPLATE_DIR}/stylesheets")) {
+        let style_entry = style_entry?;
+        let file_extension = style_entry
+            .path()
+            .extension()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or_default();
+        let file_length = style_entry.metadata()?.len() as usize;
+        if file_length == 0 {
+            continue;
+        }
+        let file_name = style_entry
+            .file_name()
+            .to_str()
+            .ok_or(Report::new("bad file name"))?
+            .to_string();
+        if file_extension == "css" {
+            let memmap = unsafe { Mmap::map(style_entry.path())? }.to_str()?;
+            let optimized = optimize_css(memmap).await?;
+            styles.insert(file_name, optimized);
+        } else if file_extension == "scss" {
+            let memmap = unsafe { Mmap::map(style_entry.path())? };
+            let compiled = compile_sass(memmap.as_ref()).await?;
+            let optimized = optimize_css(&compiled).await?;
+            styles.insert(file_name, optimized);
+        }
+    }
+
+    // minify JS
+
+    let mut js_scripts = HashMap::new();
+    for script_entry in make_template_walker!(format!("{TEMPLATE_DIR}/scripts")) {
+        let script_entry = script_entry?;
+        let file_extension = script_entry
+            .path()
+            .extension()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or_default();
+        let file_length = script_entry.metadata()?.len() as usize;
+        if file_length == 0 {
+            continue;
+        }
+        let file_name = script_entry
+            .file_name()
+            .to_str()
+            .ok_or(Report::new("bad file name"))?
+            .to_string();
+        if file_extension == "js" {
+            let mut load = Vec::with_capacity(file_length);
+            File::open(script_entry.path())
+                .await?
+                .read_to_end(&mut load)
+                .await?;
+            let mut out = Vec::new();
+            minify_js::minify(TopLevelMode::Global, load, &mut out)?;
+            js_scripts.insert(file_name, String::from_utf8(out)?);
+        }
+    }
+
+    // load shortcodes
+
+    Ok(SiteTheme {
+        syntect_colors,
+        tera_templates,
+        shortcode: Default::default(),
+        functions: Default::default(),
+        filters: Default::default(),
+        metadata,
+        styles,
+        js_scripts,
+    })
 }

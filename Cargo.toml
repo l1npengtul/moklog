@@ -32,6 +32,8 @@ tera = "1.17.1"
 markdown-toc = "0.2.0"
 syntect = "5.0.0"
 semver = "1.0.14"
+oxipng = "7.0.0"
+memmap2 = "0.5.8"
 
 [dependencies.tokio]
 version = "1.23.0"
