@@ -34,6 +34,10 @@ syntect = "5.0.0"
 semver = "1.0.14"
 oxipng = "7.0.0"
 memmap2 = "0.5.8"
+base64 = "0.20.0"
+lol_html = "0.3.2"
+dashmap = "5.4.0"
+url = "2.3.1"
 
 [dependencies.tokio]
 version = "1.23.0"

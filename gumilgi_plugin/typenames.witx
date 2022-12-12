@@ -1,0 +1,97 @@
+(typename $plugin_error 
+    (struct 
+        (field $error_code u16)
+        (field $error_message string)
+    )
+)
+
+(typename $timestamp u64)
+
+(
+    typename $version
+    (struct
+        (field $major u32)
+        (field $minor u32)
+        (field $patch u32)
+        (field $prerelease option<string>)
+        (field $metadata option<string>)
+    )
+)
+
+(timestamp $http_methods
+    (enum u8
+        $get,
+        $head,
+        $post,
+        $put,
+        $delete,
+        $connect,
+        $options,
+        $trace,
+        $patch,
+    )
+)
+
+(
+    typename $serve_path
+    (struct
+        (field $path string)
+        (field $method $http_methods)
+    )
+)
+
+(
+    typename $http_request
+    (
+        
+    )
+)
+
+;;; General Plugin
+
+(typename $plugin_info
+    (struct
+        (field $name string)
+        (field $version $version)
+        (field $authors list<string>)
+        (field $gumilgi_protocol_ver $version)
+        (field $description string)
+        (field $homepage string)
+        (field $license_spdx string)
+    )
+)
+
+(typename $permissions_general
+    (struct
+        (field $read_main_sql bool)
+        (field $write_main_sql bool)
+        (field $self_sql bool)
+        (field $internet bool)
+        (field $read_cache bool)
+        (field $modify_cache bool)
+        (field $read_main_cfg bool)
+    )
+)
+
+(typename $permissions_sitebuild
+    (struct
+        (field $modify_pages bool)
+        (field $modify_category bool)
+        (field $inject_page bool)
+        (field $process_file_ext list<string>)
+        (field $html_rewrite_selector list<string>)
+        (field $trigger_rebuild bool)
+    )
+)
+
+(typename $permissions_serve
+    (struct
+        (field $serve_pages bool)
+        (field $serve_on_paths list<string>)
+    )
+)
+
+(typename $plugin_permissions
+    (struct
+    )
+)

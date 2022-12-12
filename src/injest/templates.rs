@@ -1,4 +1,5 @@
 use crate::injest::stylesheet::{compile_sass, optimize_css};
+use crate::injest::StaticFile;
 use color_eyre::{Report, Result};
 use ignore::{Walk, WalkBuilder};
 use itertools::Itertools;
@@ -8,7 +9,7 @@ use rhai::Dynamic;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use syntect::highlighting::{Theme, ThemeSet};
 use tera::Tera;
 use tokio::fs::File;
@@ -24,6 +25,7 @@ pub struct SiteTheme {
     pub filters: HashMap<String, String>,
     pub styles: HashMap<String, String>,
     pub js_scripts: HashMap<String, String>,
+    pub files: HashSet<String, StaticFile>,
 }
 
 #[derive(Serialize, Deserialize)]
