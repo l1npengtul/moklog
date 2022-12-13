@@ -61,6 +61,8 @@ fn static_file_rewrite_element(
 }
 
 pub fn html_post_processor(
+    path: &str,
+    files: Arc<DashMap<String, StaticFile>>,
     rhai_transformers: Arc<DashMap<String, String>>,
     rewrite_plugins: Arc<DashMap<String, String>>,
     data_in: impl AsRef<[u8]>,

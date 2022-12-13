@@ -1,5 +1,6 @@
 use base64::DecodeError;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use tracing::instrument;
 
 #[derive(Clone, Debug, Default, PartialOrd, PartialEq, Serialize, Deserialize)]
@@ -25,20 +26,27 @@ pub fn hash_file(file: impl AsRef<[u8]>) -> u64 {
     seahash::hash(file)
 }
 
-pub fn new_filename(file: impl AsRef<[u8]>, filename: String) -> (u64, String) {
+pub fn new_filename(file: impl AsRef<[u8]>, filename: impl AsRef<str>) -> Option<(u64, String)> {
     let hash = hash_file(file);
     let base64 = base64::encode(hash.to_le_bytes());
-    (hash, format!("{base64}_{filename}"))
+    let split = filename.as_ref().split_once(".");
+    match split {
+        Some((fname, ext)) => Some((hash, format!("{fname}.{base64}.{ext}"))),
+        None => None,
+    }
 }
 
-pub fn parse_filename(filename: String) -> Option<(u64, String)> {
-    match filename.split_once("_") {
-        Some((hash, filename)) => match base64::decode(hash) {
-            Ok(data) => {
-                let fh = u64::from_le_bytes(data.into());
-                Some((fh, filename.to_string()))
-            }
-            Err(_) => return None,
+pub fn parse_filename(filename: impl AsRef<str>) -> Option<(u64, String)> {
+    match filename.split_once(".") {
+        Some((fname, hash_and_ext)) => match hash_and_ext.split_once(".") {
+            Some((hash, ext)) => match base64::decode(hash) {
+                Ok(data) => {
+                    let fh = u64::from_le_bytes(data.into());
+                    Some((fh, format!()))
+                }
+                Err(_) => None,
+            },
+            None => None,
         },
         None => None,
     }
