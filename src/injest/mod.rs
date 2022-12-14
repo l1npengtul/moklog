@@ -3,6 +3,7 @@ use relative_path::RelativePath;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod generate;
 pub mod processor;
 pub mod static_file;
 pub mod stylesheet;

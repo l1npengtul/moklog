@@ -3,7 +3,7 @@ use crate::injest::{
     static_file::{new_filename, StaticFile},
     stylesheet::{compile_sass, optimize_css},
 };
-use color_eyre::{Report, Result};
+use color_eyre::Result;
 use dashmap::DashMap;
 use ignore::WalkBuilder;
 use memmap2::Mmap;
@@ -19,7 +19,7 @@ use tokio::{fs::File, io::AsyncReadExt};
 pub struct SiteTheme {
     pub metadata: SiteThemeMetadata,
     pub syntect_colors: ThemeSet,
-    pub tera_templates: Tera,
+    pub tera_templates: Arc<DashMap<String, String>>,
     pub shortcode: Arc<DashMap<String, String>>,
     pub functions: Arc<DashMap<String, String>>,
     pub filters: Arc<DashMap<String, String>>,
@@ -28,40 +28,18 @@ pub struct SiteTheme {
     pub files: Arc<DashMap<String, StaticFile>>,
 }
 
-impl TryFrom<SerializeSiteTheme> for SiteTheme {
-    type Error = Report;
-
-    fn try_from(sst: SerializeSiteTheme) -> std::result::Result<Self, Self::Error> {
-        let mut tera = Tera::default();
-        tera.add_raw_templates(sst.templates.into_iter())?;
-        Ok(SiteTheme {
+impl From<SerializeSiteTheme> for SiteTheme {
+    fn from(sst: SerializeSiteTheme) -> Self {
+        SiteTheme {
             metadata: sst.metadata,
             syntect_colors: sst.syntect_colors,
-            tera_templates: tera,
-            shortcode: sst.shortcode,
-            functions: sst.functions,
-            filters: sst.filters,
-            styles: sst.styles,
-            js_scripts: sst.js_scripts,
-            files: sst.files,
-        })
-    }
-}
-
-impl From<SiteTheme> for SerializeSiteTheme {
-    fn from(st: SiteTheme) -> Self {
-        Self {
-            metadata: st.metadata,
-            syntect_colors: st.syntect_colors,
-            templates: st.tera_templates.get_template_names().map(|name| {
-                st.tera_templates.get_template(name).unwrap().
-            }),
-            shortcode: Arc::new(Default::default()),
-            functions: Arc::new(Default::default()),
-            filters: Arc::new(Default::default()),
-            styles: Arc::new(Default::default()),
-            js_scripts: Arc::new(Default::default()),
-            files: Arc::new(Default::default()),
+            tera_templates: Arc::new(sst.templates.into_iter().collect()),
+            shortcode: Arc::new(sst.shortcode.into_iter().collect()),
+            functions: Arc::new(sst.functions.into_iter().collect()),
+            filters: Arc::new(sst.filters.into_iter().collect()),
+            styles: Arc::new(sst.styles.into_iter().collect()),
+            js_scripts: Arc::new(sst.js_scripts.into_iter().collect()),
+            files: Arc::new(sst.files.into_iter().collect()),
         }
     }
 }
@@ -71,12 +49,28 @@ struct SerializeSiteTheme {
     pub metadata: SiteThemeMetadata,
     pub syntect_colors: ThemeSet,
     pub templates: BTreeMap<String, String>,
-    pub shortcode: Arc<DashMap<String, String>>,
-    pub functions: Arc<DashMap<String, String>>,
-    pub filters: Arc<DashMap<String, String>>,
-    pub styles: Arc<DashMap<String, String>>,
-    pub js_scripts: Arc<DashMap<String, String>>,
-    pub files: Arc<DashMap<String, StaticFile>>,
+    pub shortcode: BTreeMap<String, String>,
+    pub functions: BTreeMap<String, String>,
+    pub filters: BTreeMap<String, String>,
+    pub styles: BTreeMap<String, String>,
+    pub js_scripts: BTreeMap<String, String>,
+    pub files: BTreeMap<String, StaticFile>,
+}
+
+impl From<SiteTheme> for SerializeSiteTheme {
+    fn from(st: SiteTheme) -> Self {
+        SerializeSiteTheme {
+            metadata: st.metadata,
+            syntect_colors: st.syntect_colors,
+            templates: st.tera_templates.into_iter().collect(),
+            shortcode: st.shortcode.into_iter().collect(),
+            functions: st.functions.into_iter().collect(),
+            filters: st.filters.into_iter().collect(),
+            styles: st.styles.into_iter().collect(),
+            js_scripts: st.js_scripts.into_iter().collect(),
+            files: st.files.into_iter().collect(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -117,9 +111,27 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     let mut syntect_colors = ThemeSet::default();
     syntect_colors.add_from_folder(format!("{template_dir}/highlighting"))?;
 
+    // load shortcodes
+
+    let mut shortcode = DashMap::new();
+    // verify in tera
+    {
+        let mut tera = Tera::new(&template_dir!("shortcodes"))?;
+        tera.add_template_files(template_files.into_iter())?;
+    }
+    for shrtcde in walker!("shortcodes") {
+        let shrtcde = shrtcde?;
+        let file_name = path_relativizie(template_dir!("shortcodes"), shrtcde.path())?;
+        let mut short_code = String::new();
+        File::open(shrtcde.path())
+            .await?
+            .read_to_string(&mut short_code)
+            .await?;
+        shortcode.insert(file_name, short_code);
+    }
+
     // add tera templates
 
-    let mut tera_templates = Tera::default();
     let mut template_files = vec![];
     for template_entry in walker!("templates") {
         let template_entry = template_entry?;
@@ -135,7 +147,6 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         }
         template_files.push((template_entry.into_path(), Some(file_name)));
     }
-    tera_templates.add_template_files(template_files.into_iter())?;
 
     // compile scss, css
 
@@ -193,22 +204,6 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
             minify_js::minify(TopLevelMode::Global, load, &mut out)?;
             js_scripts.insert(file_name, String::from_utf8(out)?);
         }
-    }
-
-    // load shortcodes
-
-    let mut shortcode = DashMap::new();
-    // verify in tera
-    let _ = Tera::new(&template_dir!("shortcodes"))?;
-    for shrtcde in walker!("shortcodes") {
-        let shrtcde = shrtcde?;
-        let file_name = path_relativizie(template_dir!("shortcodes"), shrtcde.path())?;
-        let mut short_code = String::new();
-        File::open(shrtcde.path())
-            .await?
-            .read_to_string(&mut short_code)
-            .await?;
-        shortcode.insert(file_name, short_code);
     }
 
     // load rhai functions

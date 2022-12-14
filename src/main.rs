@@ -8,6 +8,7 @@ use moka::future::Cache;
 use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex;
 
+use crate::injest::templates::SiteTheme;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
@@ -27,6 +28,7 @@ pub struct State {
     pub database: DatabaseConnection,
     pub cache: Cache<String, Bytes>,
     pub config: Config,
+    pub theme: Option<SiteTheme>,
     pub build_mutex: Mutex<()>,
 }
 
