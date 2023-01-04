@@ -12,13 +12,11 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use syntect::highlighting::ThemeSet;
 use tera::Tera;
 use tokio::{fs::File, io::AsyncReadExt};
 
 pub struct SiteTheme {
     pub metadata: SiteThemeMetadata,
-    pub syntect_colors: ThemeSet,
     pub tera_templates: Arc<DashMap<String, String>>,
     pub shortcode: Arc<DashMap<String, String>>,
     pub functions: Arc<DashMap<String, String>>,
@@ -32,7 +30,6 @@ impl From<SerializeSiteTheme> for SiteTheme {
     fn from(sst: SerializeSiteTheme) -> Self {
         SiteTheme {
             metadata: sst.metadata,
-            syntect_colors: sst.syntect_colors,
             tera_templates: Arc::new(sst.templates.into_iter().collect()),
             shortcode: Arc::new(sst.shortcode.into_iter().collect()),
             functions: Arc::new(sst.functions.into_iter().collect()),
@@ -47,7 +44,6 @@ impl From<SerializeSiteTheme> for SiteTheme {
 #[derive(Serialize, Deserialize)]
 struct SerializeSiteTheme {
     pub metadata: SiteThemeMetadata,
-    pub syntect_colors: ThemeSet,
     pub templates: BTreeMap<String, String>,
     pub shortcode: BTreeMap<String, String>,
     pub functions: BTreeMap<String, String>,
@@ -61,7 +57,6 @@ impl From<SiteTheme> for SerializeSiteTheme {
     fn from(st: SiteTheme) -> Self {
         SerializeSiteTheme {
             metadata: st.metadata,
-            syntect_colors: st.syntect_colors,
             templates: st.tera_templates.into_iter().collect(),
             shortcode: st.shortcode.into_iter().collect(),
             functions: st.functions.into_iter().collect(),
@@ -82,7 +77,6 @@ pub struct SiteThemeMetadata {
 }
 
 pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme> {
-    let template_dir = template_dir.as_ref();
     macro_rules! template_dir {
         ($path:expr) => {
             format!("{template_dir}/{}", $path)
@@ -105,11 +99,6 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         .read_to_string(&mut template_metadata)
         .await?;
     let metadata = toml::from_str::<SiteThemeMetadata>(&template_metadata)?;
-
-    // syntax highlighting
-
-    let mut syntect_colors = ThemeSet::default();
-    syntect_colors.add_from_folder(format!("{template_dir}/highlighting"))?;
 
     // load shortcodes
 
@@ -258,7 +247,6 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     }
 
     Ok(SiteTheme {
-        syntect_colors,
         tera_templates,
         shortcode: Arc::new(shortcode),
         functions: Arc::new(functions),
