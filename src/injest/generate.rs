@@ -3,16 +3,16 @@ use color_eyre::{Report, Result};
 use once_cell::sync::Lazy;
 use pulldown_cmark::{html, CodeBlockKind, Event, Options, Parser, Tag};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tera::{Context, Tera};
-use tracing::instrument;
 use tracing::log::warn;
-use tree_sitter::Language;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SiteMeta {
     pub site_name: String,
-
+    pub categories: Vec<String>,
+    pub rss_link: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -25,7 +25,9 @@ pub struct PageMeta {
     pub tags: Vec<String>,
     pub lang: Option<String>,
     pub alt_langs: Option<Vec<String>>,
+    pub min_permission: Option<String>,
     pub index: bool,
+    pub rss: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,6 +40,7 @@ pub struct SeriesMeta {
     pub alt_langs: Option<HashMap<String, String>>,
     pub complete: bool,
     pub index: bool,
+    pub rss: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -58,10 +61,10 @@ pub struct SubCategoryMeta {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SeriesData {
+    pub series_name: String,
+    pub base_path: String,
     pub part: i32,
-    pub end: i32,
-    pub others: Vec<String>,
-    pub series: String,
+    pub parts_names_parts: Vec<(String, String)>,
 }
 
 struct TableOfContents<'a> {
@@ -71,13 +74,16 @@ struct TableOfContents<'a> {
 
 pub fn build_page(
     tera: &Tera,
+    site_meta: &SiteMeta,
+    series_meta: &Option<SeriesData>,
     page_meta: &PageMeta,
     language: Option<&str>,
     content: &str,
 ) -> Result<String> {
     let mut renderer = Parser::new_ext(content, Options::all());
     let table_of_content = pulldown_cmark_toc::TableOfContents::new(content);
-    //
+    let words = words_count::count(content).words;
+
     let mut rendered_html = String::new();
     parser_to_writer(&mut rendered_html, renderer)?;
 
@@ -90,8 +96,28 @@ pub fn build_page(
     context.insert("current_lang", language.unwrap_or_default());
     context.insert("other_langs", &page_meta.alt_langs.unwrap_or_default());
     context.insert("toc", &table_of_content.to_cmark());
+    context.insert("min_permission", &page_meta.min_permission);
+    context.insert("indexed", &page_meta.index);
+    context.insert("redirects", &page_meta.redirects);
+    context.insert("rss", &page_meta.rss);
+    context.insert("word_count", &words);
+    context.insert("reading_time_min", &((words as f32/25.0).round() / 10.0));
+    // site
+    context.insert("site_name", &site_meta.site_name);
+    context.insert("categories", &site_meta.categories);
+    context.insert("rss_link", &site_meta.rss_link);
+    if let Some(series_data) = series_meta {
+        context.insert("series_name", &series_data.series_name);
+        context.insert("series_base_path", &series_data.base_path);
+        context.insert("series_current_part", &series_data.part);
+        let (titles, links) = series_data.parts_names_parts.iter().map(|(a, b)|, (a, b)).collect::<(Vec<&String>, Vec<&String>)>();
+        context.insert("series_titles", &titles);
+        context.insert("series_links", &links);
+    }
 
-
+    // template it
+    let rendered = tera.render(&page_meta.template.unwrap_or_default(), &context)?;
+    Ok(rendered)
 }
 
 struct Code {
@@ -114,7 +140,6 @@ where
                         code: "".to_string(),
                     });
                 }
-                Tag::Heading()
                 _ => {}
             },
             Event::End(end) => match end {

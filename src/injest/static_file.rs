@@ -38,8 +38,8 @@ pub fn new_filename(file: impl AsRef<[u8]>, filename: impl AsRef<str>) -> Option
 
 pub fn parse_filename(filename: impl AsRef<str>) -> Option<(u64, String)> {
     match filename.split_once(".") {
-        Some((fname, hash_and_ext)) => match hash_and_ext.split_once(".") {
-            Some((hash, ext)) => match base64::decode(hash) {
+        Some((_, hash_and_ext)) => match hash_and_ext.split_once(".") {
+            Some((hash, _)) => match base64::decode(hash) {
                 Ok(data) => {
                     let fh = u64::from_le_bytes(data.into());
                     Some((fh, format!()))
