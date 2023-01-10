@@ -11,6 +11,7 @@ use minify_js::TopLevelMode;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::str::pattern::Pattern;
 use std::sync::Arc;
 use tera::Tera;
 use tokio::{fs::File, io::AsyncReadExt};
@@ -21,6 +22,7 @@ pub struct SiteTheme {
     pub shortcode: Arc<DashMap<String, String>>,
     pub functions: Arc<DashMap<String, String>>,
     pub filters: Arc<DashMap<String, String>>,
+    pub testers: Arc<DashMap<String, String>>,
     pub styles: Arc<DashMap<String, String>>,
     pub js_scripts: Arc<DashMap<String, String>>,
     pub files: Arc<DashMap<String, StaticFile>>,
@@ -34,6 +36,7 @@ impl From<SerializeSiteTheme> for SiteTheme {
             shortcode: Arc::new(sst.shortcode.into_iter().collect()),
             functions: Arc::new(sst.functions.into_iter().collect()),
             filters: Arc::new(sst.filters.into_iter().collect()),
+            testers: Arc::new(sst.testers.into_iter().collect()),
             styles: Arc::new(sst.styles.into_iter().collect()),
             js_scripts: Arc::new(sst.js_scripts.into_iter().collect()),
             files: Arc::new(sst.files.into_iter().collect()),
@@ -48,6 +51,7 @@ struct SerializeSiteTheme {
     pub shortcode: BTreeMap<String, String>,
     pub functions: BTreeMap<String, String>,
     pub filters: BTreeMap<String, String>,
+    pub testers: BTreeMap<String, String>,
     pub styles: BTreeMap<String, String>,
     pub js_scripts: BTreeMap<String, String>,
     pub files: BTreeMap<String, StaticFile>,
@@ -83,8 +87,8 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         };
     }
     macro_rules! walker {
-        ($path:expr) => {{
-            WalkBuilder::new(template_dir!($path))
+        ($dir:expr, $path:expr) => {{
+            WalkBuilder::new(template_dir!($dir, $path))
                 .ignore(true)
                 .add_custom_ignore_filename(".gmignore")
                 .build()
@@ -108,9 +112,10 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         let mut tera = Tera::new(&template_dir!("shortcodes"))?;
         tera.add_template_files(template_files.into_iter())?;
     }
-    for shrtcde in walker!("shortcodes") {
+    for shrtcde in walker!(template_dir, "shortcodes") {
         let shrtcde = shrtcde?;
-        let file_name = path_relativizie(template_dir!("shortcodes"), shrtcde.path())?;
+        let file_name =
+            path_relativizie(template_dir!(template_dir, "shortcodes"), shrtcde.path())?;
         let mut short_code = String::new();
         File::open(shrtcde.path())
             .await?
@@ -122,7 +127,7 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     // add tera templates
 
     let mut template_files = vec![];
-    for template_entry in walker!("templates") {
+    for template_entry in walker!(template_dir, "templates") {
         let template_entry = template_entry?;
         let file_extension = template_entry
             .path()
@@ -130,7 +135,10 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
             .unwrap_or_default()
             .to_str()
             .unwrap_or_default();
-        let file_name = path_relativizie(template_dir!("templates"), template_entry.path())?;
+        let file_name = path_relativizie(
+            template_dir!(template_dir, "templates"),
+            template_entry.path(),
+        )?;
         if file_extension != "html" || file_extension != "tera" {
             continue;
         }
@@ -140,7 +148,7 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     // compile scss, css
 
     let mut styles = DashMap::new();
-    for style_entry in walker!("stylesheets") {
+    for style_entry in walker!(template_dir, "stylesheets") {
         let style_entry = style_entry?;
         let file_extension = style_entry
             .path()
@@ -153,7 +161,10 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
             continue;
         }
 
-        let file_name = path_relativizie(template_dir!("stylesheets"), style_entry.path())?;
+        let file_name = path_relativizie(
+            template_dir!(template_dir, "stylesheets"),
+            style_entry.path(),
+        )?;
 
         if file_extension == "css" {
             let memmap = unsafe { Mmap::map(style_entry.path())? }.to_str()?;
@@ -170,7 +181,7 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     // minify JS
 
     let mut js_scripts = DashMap::new();
-    for script_entry in walker!("scripts") {
+    for script_entry in walker!(template_dir, "scripts") {
         let script_entry = script_entry?;
         let file_extension = script_entry
             .path()
@@ -182,7 +193,8 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         if file_length == 0 {
             continue;
         }
-        let file_name = path_relativizie(template_dir!("scripts"), script_entry.path())?;
+        let file_name =
+            path_relativizie(template_dir!(template_dir, "scripts"), script_entry.path())?;
         if file_extension == "js" {
             let mut load = Vec::with_capacity(file_length);
             File::open(script_entry.path())
@@ -198,9 +210,22 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     // load rhai functions
 
     let mut functions = DashMap::new();
-    for func in walker!("functions") {
+    for func in walker!(template_dir, "functions") {
         let func = func?;
-        let file_name = path_relativizie(template_dir!("shortcodes"), func.path())?;
+        if ft
+            .path()
+            .extension()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or_default()
+            != "rhai"
+        {
+            continue;
+        }
+        let file_name = path_relativizie(template_dir!(template_dir, "shortcodes"), func.path())?;
+        if file_name.ends_with(".rhai") {
+            file_name.strip_suffix_of(".rhai")
+        }
         let mut function = String::new();
         File::open(func.path())
             .await?
@@ -212,21 +237,60 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     // load rhai filters
 
     let mut filters = DashMap::new();
-    for ft in walker!("filters") {
+    for ft in walker!(template_dir, "filters") {
         let ft = ft?;
+        if ft
+            .path()
+            .extension()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or_default()
+            != "rhai"
+        {
+            continue;
+        }
         let file_name = path_relativizie("filters", ft.path())?;
+        if file_name.ends_with(".rhai") {
+            file_name.strip_suffix_of(".rhai")
+        }
         let mut filter = String::new();
         File::open(ft.path())
             .await?
             .read_to_string(&mut filter)
             .await?;
-        functions.insert(file_name, filter);
+        filters.insert(file_name, filter);
+    }
+    // load rhai testers
+
+    let mut testers = DashMap::new();
+    for ft in walker!(template_dir, "testers") {
+        let ft = ft?;
+        if ft
+            .path()
+            .extension()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or_default()
+            != "rhai"
+        {
+            continue;
+        }
+        let mut file_name = path_relativizie("testers", ft.path())?;
+        if file_name.ends_with(".rhai") {
+            file_name.strip_suffix_of(".rhai")
+        }
+        let mut test = String::new();
+        File::open(ft.path())
+            .await?
+            .read_to_string(&mut test)
+            .await?;
+        testers.insert(file_name, test);
     }
 
     // load static files
 
     let mut files = DashMap::new();
-    for file in walker!("static") {
+    for file in walker!(template_dir, "static") {
         let file = file?;
         if file.metadata()?.len() != 0 {
             let data = unsafe { Mmap::map(file.path())? };
@@ -255,5 +319,6 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         styles: Arc::new(styles),
         js_scripts: Arc::new(js_scripts),
         files: Arc::new(files),
+        testers: Arc::new(testers),
     })
 }
