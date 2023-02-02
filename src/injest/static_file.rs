@@ -1,7 +1,9 @@
 use base64::DecodeError;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::path::Path;
 use tracing::instrument;
+use color_eyre::Result;
 
 #[derive(Clone, Debug, Default, PartialOrd, PartialEq, Serialize, Deserialize)]
 pub struct StaticFile {
@@ -26,7 +28,7 @@ pub fn hash_file(file: impl AsRef<[u8]>) -> u64 {
     seahash::hash(file)
 }
 
-pub fn new_filename(file: impl AsRef<[u8]>, filename: impl AsRef<str>) -> Option<(u64, String)> {
+pub fn new_filename(file: impl AsRef<[u8]>, filename: impl AsRef<Path>) -> Option<(u64, String)> {
     let hash = hash_file(file);
     let base64 = base64::encode(hash.to_le_bytes());
     let split = filename.as_ref().split_once(".");
@@ -49,5 +51,11 @@ pub fn parse_filename(filename: impl AsRef<str>) -> Option<(u64, String)> {
             None => None,
         },
         None => None,
+    }
+}
+
+pub fn optimize_file(path: impl AsRef<Path>, extension: &str, data: impl AsRef<[u8]>) -> Result<Option<Box<impl AsRef<[u8]>>>> {
+    match extension {
+        ""
     }
 }

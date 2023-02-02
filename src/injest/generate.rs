@@ -9,16 +9,33 @@ use tracing::log::warn;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SiteServe {
+    Cache {
+        size: i32,
+        store: String,
+    },
+    Memory,
+}
+
+impl Default for SiteServe {
+    fn default() -> Self {
+        SiteServe::Cache { size: 25, store: "srv".to_string() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SiteMeta {
     pub site_name: String,
+    pub serve: SiteServe,
     pub categories: Vec<String>,
-    pub rss_link: Option<String>,
+    pub rss: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageMeta {
     pub title: String,
     pub author: String,
+    pub rehydrate: i64,
     pub date: DateTime<Utc>,
     pub redirects: Vec<String>,
     pub template: Option<String>,

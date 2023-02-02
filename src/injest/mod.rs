@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use relative_path::RelativePath;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub mod build;
 pub mod generate;
@@ -15,4 +15,11 @@ pub fn path_relativizie(base: impl AsRef<Path>, item: impl AsRef<Path>) -> Resul
     let item = RelativePath::new(item);
     let new = item.strip_prefix(base)?;
     Ok(new.to_string())
+}
+
+pub fn path_relativizie_path(base: impl AsRef<Path>, item: impl AsRef<Path>) -> Result<PathBuf> {
+    let base = RelativePath::new(base.as_ref());
+    let item = RelativePath::new(item);
+    let new = item.strip_prefix(base)?;
+    Ok(new.into())
 }

@@ -1,23 +1,25 @@
 use crate::injest::{
     generate::{CategoryMeta, PageMeta, SeriesMeta, SiteMeta, SubCategoryMeta},
-    path_relativizie,
+    path_relativizie_path,
     templates::SiteTheme,
 };
+use bidirectional_map::Bimap;
 use color_eyre::{Report, Result};
-use ignore::{DirEntry, WalkBuilder};
+use id_tree::InsertBehavior::{AsRoot, UnderNode};
+use id_tree::{Node, Tree};
+use ignore::WalkBuilder;
+use itertools::Itertools;
 use memmap2::MmapOptions;
-use petgraph::{prelude::GraphMap, Directed};
-use rhai::{Engine, Scope, AST};
+use rhai::{Engine, EvalAltResult, Scope, AST};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    str::{from_utf8, FromStr},
-};
+use std::{collections::HashMap, path::Path, str::FromStr};
 use tera::{Context, Filter, Function, Tera};
 use tera::{Test, Value};
+use tracing::log::{error, log, warn};
 
 struct Empty {}
 
@@ -28,28 +30,40 @@ impl AsRef<[u8]> for Empty {
     }
 }
 
+macro_rules! mmap_load {
+    ($path:expr) => {{
+        let a: Box<impl AsRef<[u8]>> = match unsafe { MmapOptions::new().map(path.as_path()) } {
+            Ok(a) => Box::new(a),
+            Err(_) => Box::new(Empty {}),
+        };
+        a
+    }};
+}
+
 pub enum ConfigurationType {
-    Category(CategoryMeta),
-    SubCategory(SubCategoryMeta),
-    Redirect(RedirectMeta),
-    Series(SeriesMeta),
+    Category,
+    SubCategory,
+    Redirect,
+    Series,
     Page,
+    External,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RedirectMeta {
-    pub to: Vec<String>,
+pub enum ExternalType {
+    InDir,
+    Plugin { plugin: String, resource: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConfigMeta {
-    pub external: bool,
+    pub external: Option<ExternalType>,
     #[serde(flatten)]
     pub page: PageMeta,
     pub category: Option<CategoryMeta>,
     pub subcategory: Option<SubCategoryMeta>,
     pub series: Option<SeriesMeta>,
-    pub redirect: Option<RedirectMeta>,
+    pub redirect: Option<String>,
 }
 
 struct RhaiFilter {
@@ -131,96 +145,181 @@ impl Function for Shortcode {
     }
 }
 
+fn shell(cmd: &str) -> Result<(i32, String, String), Box<EvalAltResult>> {
+    if cmd == "" {
+        return Err("Bad Command!".into());
+    }
+    let exec = cmd.split_once(" ");
+    let mut command = match exec {
+        None => Command::new(cmd),
+        Some((c, a)) => Command::new(c).arg(a),
+    };
+    let out = match command.output() {
+        Ok(out) => out,
+        Err(why) => {
+            return Err(why.to_string().into());
+        }
+    };
+    let out_stdout = String::from_utf8(out.stdout).unwrap_or_default();
+    let out_stderr = String::from_utf8(out.stderr).unwrap_or_default();
+    let out_code = match out.status.code() {
+        Some(c) => c,
+        None => i32::MIN_VALUE,
+    };
+    Ok((out_code, out_stdout, out_stderr))
+}
+
+fn log(out: &str) {
+    log!(out)
+}
+
+fn warn(out: &str) {
+    warn!(out)
+}
+
+fn error(out: &str) {
+    error!(out)
+}
+
+const IGNORES: &'static [&str] = &["build.rhai"];
+
+macro_rules! walker {
+    ($path:expr) => {
+        WalkBuilder::new($path).add_custom_ignore_filename(".mkignore")
+    };
+}
+
+fn file_name_from_path(path: impl AsRef<Path>) -> Option<&str> {
+    match path.as_ref().file_name() {
+        Some(file) => match file.to_str() {
+            Some(f) => Some(f),
+            None => None,
+        },
+        None => None,
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
+pub enum LeafPathType {
+    Moklog,
+    Page,
+}
+
+pub struct LeafPath<T>
+where
+    T: AsRef<[u8]>,
+{
+    data: Box<T>,
+    typ: LeafPathType,
+    true_path: PathBuf,
+}
+
+pub struct FilePath {
+    path: PathBuf,
+    is_file: bool,
+}
+
 pub fn build_site(
     site_build_path: impl AsRef<Path>,
     site_output_path: impl AsRef<Path>,
     site_config: &SiteMeta,
     template: &SiteTheme,
 ) -> Result<()> {
-    // traverse site build path
-    let mut sitebuild_traveller = WalkBuilder::new(&site_build_path)
-        .build()
-        .collect::<Result<Vec<DirEntry>>>()?;
-    sitebuild_traveller.sort_by(|a, b| a.depth().cmp(&b.depth()));
+    // run site build script
+    let mut engine = Engine::new();
+    engine.register_fn("shell", shell);
+    engine.register_fn("log", log);
+    engine.register_fn("warn", warn);
+    engine.register_fn("error", error);
+    let ast = match engine.compile_file(site_build_path.as_ref().with_file_name("build.rhai")) {
+        Ok(ast) => ast,
+        Err(why) => return Err(Report::msg(why.to_string())),
+    };
+    engine.run_ast(&ast);
 
-    let mut sc_backing = HashMap::new();
-    let mut pages = HashMap::new();
-    let mut site_children: GraphMap<&str, Directed, _> = GraphMap::new();
+    // traverse site build path
+    let mut sitebuild_traveller = walker!(&site_build_path).build();
+    let mut site_tree = Tree::new();
+    let mut node_path_store = Bimap::new();
+    let mut root_id = None;
+
+    let mut fs_tree = Tree::new();
+    let mut fs_root_id = None;
 
     for file in sitebuild_traveller {
-        let mut path_str = path_relativizie(&site_build_path, file)?;
-        let mut path = PathBuf::from_str(&path_str)?;
+        let file = path_relativizie_path(&site_build_path, file?.into_path())?;
 
-        let filename = match path.file_name() {
-            Some(file) => match file.to_str() {
-                Some(f) => f,
-                None => return Err(Report::msg("non utf8 filename")),
-            },
-            None => {
-                if let Some(end) = path.into_iter().last() {
-                    match end.to_str() {
-                        Some(end) => {
-                            if !end.chars().next().unwrap().is_alphabetic() {
-                                return Err(Report::msg(
-                                    "folder cannot start with non-ascii-alphanumeric character!",
-                                ));
+        let mut spath = file.clone();
+        let mut previous = spath.clone();
+
+        let mut is_file = false;
+
+        // check if previous exists
+        let insert_behaviour = match node_path_store.get(&previous) {
+            Some(node_id) => UnderNode(node_id),
+            None => AsRoot,
+        };
+
+        if file.is_file() {
+            spath.pop();
+            previous.pop();
+            previous.pop();
+
+            is_file = true;
+
+            let filename = match file.file_name() {
+                Some(f) => match f.to_str() {
+                    Some(f) => f,
+                    None => return Err(Report::msg("non utf8 filename")),
+                },
+                None => {
+                    if let Some(end) = path.into_iter().last() {
+                        match end.to_str() {
+                            Some(end) => {
+                                if !end.chars().next().unwrap().is_alphabetic() {
+                                    return Err(Report::msg(
+                                        "folder cannot start with non-ascii-alphanumeric character!",
+                                    ));
+                                }
+                                continue;
                             }
-                            continue;
+                            None => return Err(Report::msg("non utf8 filename")),
                         }
-                        None => return Err(Report::msg("non utf8 filename")),
                     }
                 }
-            }
-        };
-
-        let filemap: Box<impl AsRef<[u8]>> = match unsafe { MmapOptions::new().map(path.as_path()) }
-        {
-            Ok(a) => Box::new(a),
-            Err(_) => Box::new(Empty {}),
-        };
-
-        path.pop();
-        if filename == "index.md" || filename == "index.html" {
-            let (cfg, content) = match from_utf8(&filemap)?.split_once("===") {
-                Some((cfg, cot)) => (cfg, Some(cot)),
-                None => (from_utf8(&filemap)?, None),
             };
 
-            let meta = toml::from_str::<ConfigMeta>(cfg)?;
-            pages.insert(&path_str, (meta.page, content));
+            if ["index.md", "index.html", ".moklog"].contains(&filename) {
+                let filemap = mmap_load!(&file);
+                let lpt = if filename == ".moklog" {
+                    LeafPathType::Moklog
+                } else {
+                    LeafPathType::Page
+                };
+                let node = Node::new(LeafPath {
+                    data: filemap,
+                    typ: lpt,
+                    true_path: file,
+                });
 
-            let mut previous = "";
-            for p in path.iter() {
-                let nodestr = p.to_str().unwrap();
-                if !site_children.contains_node(nodestr) {
-                    site_children.add_node(nodestr);
-                    if previous != "" {
-                        site_children.add_edge(previous, nodestr, Directed {});
-                    }
+                let id = site_tree.insert(node, insert_behaviour)?;
+                if insert_behaviour == AsRoot {
+                    root_id = Some(id.clone());
                 }
-                previous = nodestr;
+                node_path_store.insert(spath, id);
+                continue;
             }
+        }
 
-            match (meta.series, meta.subcategory, meta.category, meta.redirect) {
-                (Some(series), None, None, None) => {
-                    sc_backing.insert(&path_str, ConfigurationType::Series(series));
-                }
-                (None, Some(subcat), None, None) => {
-                    sc_backing.insert(&path_str, ConfigurationType::SubCategory(subcat));
-                }
-                (None, None, Some(cat), None) => {
-                    sc_backing.insert(&path_str, ConfigurationType::Category(cat));
-                }
-                (None, None, None, Some(redirect)) => {
-                    sc_backing.insert(&path_str, ConfigurationType::Redirect(redirect));
-                }
-                (None, None, None, None, None) => {
-                    sc_backing.insert(&path_str, ConfigurationType::Page)
-                }
-                _ => Report::msg("Bad configuration file"),
-            }
-        } else if filename == ".gumilgi" {
-            let meta = toml::from_slice::<ConfigMeta>(&filemap)?;
+        let id = fs_tree.insert(
+            Node::new(FilePath {
+                path: file,
+                is_file,
+            }),
+            insert_behaviour,
+        )?;
+        if insert_behaviour == AsRoot {
+            fs_root_id = Some(id.clone());
         }
     }
 
@@ -280,8 +379,27 @@ pub fn build_site(
         )
     }
 
-    for endpoint in WalkBuilder::new(&site_build_path).build() {
-        let endpoint = endpoint?;
+    if let Some(fs_rid) = fs_root_id {
+        for file_path in fs_tree.traverse_pre_order(&fs_rid)? {
+            let fp = &file_path.data().path;
+            // let filemap = mmap_load!(fp);
+            // if let Some(file_extension) = fp.extension() {
+            //     if let Some(file_extension) = file_extension.to_str() {}
+            // TODO: file optimizations and plugin goodness
+            let new_path = site_output_path.as_ref().to_path_buf() + fp;
+            std::fs::rename(fp, new_path)?;
+        }
+    }
+
+    if let Some(rid) = root_id {
+        for endpoint_id in site_tree.traverse_post_order_ids(&rid)? {
+            let endpoint_path = match node_path_store.get_rev(&endpoint_id) {
+                Some(p) => p,
+                None => continue, // TODO: error
+            };
+
+            let endpoint = site_tree.get(&endpoint_id).unwrap();
+        }
     }
 
     Ok(())
