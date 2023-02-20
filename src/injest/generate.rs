@@ -62,19 +62,8 @@ pub struct SeriesMeta {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CategoryMeta {
-    pub name: String,
-    pub alt_names: Option<Vec<(String, String)>>,
-    pub default_lang: Option<String>,
-    pub default_template: Option<String>,
-    pub include_rss: bool,
-    pub index: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SubCategoryMeta {
-    pub name: String,
-    pub alt_names: Option<Vec<(String, String)>>,
-    pub default_lang: Option<String>,
+    pub display: String,
+    pub translations: Option<Vec<(String, String)>>,
     pub default_template: Option<String>,
     pub include_rss: bool,
     pub index: bool,

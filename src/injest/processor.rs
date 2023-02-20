@@ -14,7 +14,7 @@ pub struct DocumentStatistics {
 
 pub fn static_file_rewriter(
     path: String,
-    files: Arc<DashMap<String, StaticFile>>,
+    files: Arc<DashMap<String, String>>,
     out: &mut impl Write,
     data_in: impl AsRef<[u8]>,
 ) -> Result<()> {
@@ -35,7 +35,7 @@ pub fn static_file_rewriter(
 
 fn static_file_rewrite_element(
     path: &str,
-    files: Arc<DashMap<String, StaticFile>>,
+    files: Arc<DashMap<String, String>>,
     element: &mut Element,
 ) {
     let (da_linkie, attr) = match (element.get_attribute("href"), element.get_attribute("src")) {
@@ -71,7 +71,7 @@ pub struct ProcessedDocument {
 
 pub fn html_post_processor(
     path: &str,
-    files: Arc<DashMap<String, StaticFile>>,
+    files: Arc<DashMap<String, String>>,
     data_in: &str,
 ) -> Result<ProcessedDocument> {
     let character_count = AtomicU64::new(0);

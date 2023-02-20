@@ -6,7 +6,7 @@ use crate::injest::{
 use bidirectional_map::Bimap;
 use color_eyre::{Report, Result};
 use id_tree::InsertBehavior::{AsRoot, UnderNode};
-use id_tree::{Node, Tree};
+use id_tree::{Node, NodeId, RemoveBehavior, Tree};
 use ignore::WalkBuilder;
 use itertools::Itertools;
 use memmap2::MmapOptions;
@@ -17,9 +17,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, path::Path, str::FromStr};
+use std::ffi::OsStr;
+use std::str::from_utf8;
+use std::sync::Arc;
+use axum::body::HttpBody;
+use dashmap::DashMap;
+use language_tags::LanguageTag;
 use tera::{Context, Filter, Function, Tera};
 use tera::{Test, Value};
 use tracing::log::{error, log, warn};
+use crate::injest::static_file::{new_filename, process_static_file};
 
 struct Empty {}
 
@@ -61,7 +68,6 @@ pub struct ConfigMeta {
     #[serde(flatten)]
     pub page: PageMeta,
     pub category: Option<CategoryMeta>,
-    pub subcategory: Option<SubCategoryMeta>,
     pub series: Option<SeriesMeta>,
     pub redirect: Option<String>,
 }
@@ -203,12 +209,39 @@ fn file_name_from_path(path: impl AsRef<Path>) -> Option<&str> {
 pub enum LeafPathType {
     Moklog,
     Page,
+    PreBuilt,
 }
 
-pub struct LeafPath<T>
+pub struct LeafPath<T> where T: AsRef<[u8]> {
+    file_name: String,
+    data: Option<LeafPathData<T>>
+}
+
+impl<T> LeafPath<T> where T: AsRef<[u8]> {
+    pub fn set_data(&mut self, data: LeafPathData<T>) {
+        self.data = Some(data)
+    }
+
+    pub fn data(&self) -> &Option<LeafPathData<T>> {
+        &self.data
+    }
+
+    pub fn data_mut(&mut self) -> &mut Option<LeafPathData<T>> {
+        &mut self.data
+    }
+}
+
+pub struct LeafPathData<T>
 where
     T: AsRef<[u8]>,
 {
+    data: Box<T>,
+    typ: LeafPathType,
+    true_path: PathBuf,
+    translations: HashMap<LanguageTag, TranslateLeaf<T>>
+}
+
+pub struct TranslateLeaf<T> where T: AsRef<[u8]> {
     data: Box<T>,
     typ: LeafPathType,
     true_path: PathBuf,
@@ -218,6 +251,16 @@ pub struct FilePath {
     path: PathBuf,
     is_file: bool,
 }
+
+const RESERVED_NAMES: &[&str] = &["template", "files", "static", "admin", "user", "me", "api", "stat", "error"];
+
+const RESERVED_CHARS: &[char] = &[
+    '{' , '}' , '|' , '\\' , '^' ,'[' , ']' , '`',
+    ';' , '/' , '?' , ':' , '@' , '&' , '=' , '+' , '$' , ',',
+    ' ', '<' , '>' , '#' , '%' , '"', '\''
+];
+
+const SPLITTER: &str = "===";
 
 pub fn build_site(
     site_build_path: impl AsRef<Path>,
@@ -238,88 +281,148 @@ pub fn build_site(
     engine.run_ast(&ast);
 
     // traverse site build path
-    let mut sitebuild_traveller = walker!(&site_build_path).build();
+    let mut sitebuild_traveller = walker!(&site_build_path).filter_entry(|dir| {
+        dir.file_name().to_str().map(|f| {
+            RESERVED_NAMES.contains(&f)
+        }).unwrap_or(false)
+    });
     let mut site_tree = Tree::new();
     let mut node_path_store = Bimap::new();
     let mut root_id = None;
 
-    let mut fs_tree = Tree::new();
+    let mut fs_tree: Tree<LeafPath<[u8]>> = Tree::new();
+    let mut fs_path_store = Bimap::new();
     let mut fs_root_id = None;
 
-    for file in sitebuild_traveller {
+    let mut files = HashMap::new();
+    for (hash, file) in template.files.iter().map(|x| (*x.key(), x.value().clone())) {
+        files.insert(hash, file);
+    }
+
+    let mut site_categories = HashMap::new();
+
+    for file in sitebuild_traveller.build() {
         let file = path_relativizie_path(&site_build_path, file?.into_path())?;
-
-        let mut spath = file.clone();
-        let mut previous = spath.clone();
-
-        let mut is_file = false;
 
         // check if previous exists
         let insert_behaviour = match node_path_store.get(&previous) {
             Some(node_id) => UnderNode(node_id),
-            None => AsRoot,
+            None => {
+                if root_id.is_none() {
+                    AsRoot
+                } else {
+                    warn!("Orphaned Item Detected!");
+                    continue;
+                }
+            },
+        };
+
+        let filename = match file.file_name() {
+            Some(f) => match f.to_str() {
+                Some(f) => f,
+                None => return Err(Report::msg("non utf8 filename")),
+            },
+            None => {
+                if let Some(end) = path.into_iter().last() {
+                    match end.to_str() {
+                        Some(end) => {
+                            if !end.chars().next().unwrap().is_alphabetic() {
+                                return Err(Report::msg(
+                                    "folder cannot start with non-ascii-alphanumeric character!",
+                                ));
+                            }
+                            continue;
+                        }
+                        None => return Err(Report::msg("non utf8 filename")),
+                    }
+                }
+            }
+        };
+
+        let file_extension = match file.extension().map(|x| x.to_str()).flatten() {
+            Some(ext) => ext,
+            None => return Err(Report::msg("non utf8 filename")),
+        };
+
+        let file_nonext = match file.file_prefix().map(|x| x.to_str()).flatten() {
+            Some(ext) => ext,
+            None => return Err(Report::msg("non utf8 filename")),
         };
 
         if file.is_file() {
-            spath.pop();
-            previous.pop();
-            previous.pop();
-
-            is_file = true;
-
-            let filename = match file.file_name() {
-                Some(f) => match f.to_str() {
-                    Some(f) => f,
-                    None => return Err(Report::msg("non utf8 filename")),
-                },
-                None => {
-                    if let Some(end) = path.into_iter().last() {
-                        match end.to_str() {
-                            Some(end) => {
-                                if !end.chars().next().unwrap().is_alphabetic() {
-                                    return Err(Report::msg(
-                                        "folder cannot start with non-ascii-alphanumeric character!",
-                                    ));
-                                }
-                                continue;
-                            }
-                            None => return Err(Report::msg("non utf8 filename")),
-                        }
-                    }
-                }
+            let parent = match file.parent().map(|path | fs_path_store.get_rev(path)).flatten() {
+                Some(p) => p,
+                None => return Err(Report::msg("no parent path!")),
             };
 
+            let path_type = match file_extension {
+                "md" => LeafPathType::Page,
+                "html" => LeafPathType::PreBuilt,
+                "moklog" => LeafPathType::Moklog,
+                _ => continue,
+            };
+
+            let filemap: Box<[u8]>  = mmap_load!(&file);
+
             if ["index.md", "index.html", ".moklog"].contains(&filename) {
-                let filemap = mmap_load!(&file);
-                let lpt = if filename == ".moklog" {
-                    LeafPathType::Moklog
+                let parent_node = fs_tree.get_mut(parent)?;
+
+                let data = parent_node.data_mut();
+                data.data = Some(
+                    LeafPathData {
+                        data: filemap,
+                        typ: path_type,
+                        true_path: file,
+                        translations: Default::default(),
+                    }
+                );
+            } else if file_extension == "md" || file_extension == "html" || file_extension == "moklog" {
+                if let Ok(lang_tag) = LanguageTag::parse(file_nonext) {
+                    // get parent
+                    let parent_node = fs_tree.get_mut(parent)?;
+
+                    let data = parent_node.data_mut();
+                    if let Some(lpd) = data.data_mut() {
+
+                        lpd.translations.insert(lang_tag, TranslateLeaf {
+                            data: filemap,
+                            typ: path_type,
+                            true_path: file,
+                        });
+                    } else {
+                        warn!("orphan file!");
+                    }
                 } else {
-                    LeafPathType::Page
-                };
-                let node = Node::new(LeafPath {
-                    data: filemap,
-                    typ: lpt,
-                    true_path: file,
-                });
-
-                let id = site_tree.insert(node, insert_behaviour)?;
-                if insert_behaviour == AsRoot {
-                    root_id = Some(id.clone());
+                    warn!("orphan file!");
                 }
-                node_path_store.insert(spath, id);
-                continue;
+            } else {
+                match process_static_file(file) {
+                    Some(file) => {
+                        files.insert(file.0, file.1);
+                    }
+                    None => {
+                        warn!("failed to hash file!")
+                    }
+                }
             }
-        }
+        } else {
+            if let Ok(_) = LanguageTag::parse(filename) {
+                return Err(Report::msg("folder cannot be a language tag!"));
+            }
 
-        let id = fs_tree.insert(
-            Node::new(FilePath {
-                path: file,
-                is_file,
-            }),
-            insert_behaviour,
-        )?;
-        if insert_behaviour == AsRoot {
-            fs_root_id = Some(id.clone());
+            if RESERVED_NAMES.contains(&filename) || filename.contains(RESERVED_CHARS) {
+                return Err(Report::msg("folder reserved word/invalid char!"));
+            }
+
+            let leaf_path = LeafPath { file_name: filename.to_string(), data: None };
+            let node = fs_tree.insert(Node::new(
+                leaf_path
+            ), insert_behaviour)?;
+            if insert_behaviour == AsRoot {
+                fs_root_id = Some(node.clone());
+            }
+
+            fs_path_store.insert(node, file);
         }
     }
 
@@ -379,26 +482,111 @@ pub fn build_site(
         )
     }
 
+    let mut categories = HashMap::new();
+
     if let Some(fs_rid) = fs_root_id {
-        for file_path in fs_tree.traverse_pre_order(&fs_rid)? {
-            let fp = &file_path.data().path;
-            // let filemap = mmap_load!(fp);
-            // if let Some(file_extension) = fp.extension() {
-            //     if let Some(file_extension) = file_extension.to_str() {}
-            // TODO: file optimizations and plugin goodness
-            let new_path = site_output_path.as_ref().to_path_buf() + fp;
-            std::fs::rename(fp, new_path)?;
+        loop {
+            let mut bad_paths = vec![];
+            for file_id in fs_tree.traverse_post_order_ids(&fs_rid)? {
+                let data = fs_tree.get(&file_id).unwrap();
+                if data.data().data.is_none() {
+                    bad_paths.push(file_id)
+                }
+            }
+            if bad_paths.len() == 0 {
+                break
+            }
+            for bad in bad_paths {
+                if bad != fs_rid {
+                    let _err = fs_tree.remove_node(bad, RemoveBehavior::DropChildren);
+                }
+            }
+        }
+
+        // for reasons we do this horribleness bc i am a shit programmer and i hate performance
+        for depths in 1..=2 {
+            for possible_category in sitebuild_traveller.max_depth(Some(depths)).build() {
+                let possible_category = possible_category?;
+                let path = possible_category.path();
+
+                if path.is_dir() {
+                    let path_data_id = match fs_path_store.get_rev(path) {
+                        Some(d) => d,
+                        None => continue,
+                    };
+
+                    let path_data = fs_tree.get(path_data_id).unwrap();
+
+                    // parse front matter
+
+                    match &path_data.data().data {
+                        Some(data) => {
+                            let (cfg, _) = match from_utf8(&data.data)?.split_once(SPLITTER) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+
+                            let config = toml::from_str::<ConfigMeta>(cfg)?;
+
+                            if let Some(cat_cfg) = config.category {
+                                let this_dir = match path.file_prefix().map(|x| x.to_str()).flatten() {
+                                    Some(pre) => pre,
+                                    None => continue,
+                                };
+                                if depths == 1 {
+                                    site_categories.insert(this_dir.to_string(), cat_cfg);
+                                } else {
+                                    let parent = match path_data.parent() {
+                                        Some(p) => p,
+                                        None => continue,
+                                    };
+
+                                    let path_data = fs_tree.get(path_data_id).unwrap();
+
+                                }
+                            }
+
+                        }
+                        None => continue,
+                    }
+                }
+            }
         }
     }
 
+
     if let Some(rid) = root_id {
-        for endpoint_id in site_tree.traverse_post_order_ids(&rid)? {
+        for endpoint_id in site_tree.traverse_pre_order_ids(&rid)? {
             let endpoint_path = match node_path_store.get_rev(&endpoint_id) {
                 Some(p) => p,
                 None => continue, // TODO: error
             };
 
             let endpoint = site_tree.get(&endpoint_id).unwrap();
+            let file = from_utf8(&endpoint.data().data)?;
+            let (config, content) = match file.split_once("===") {
+                Some((c, t)) => {
+                    (toml::from_str::<ConfigMeta>(c)?, t)
+                }
+                None => continue,
+            };
+
+            // get the important data: category? subcategory?
+
+            let path_components = endpoint_path.components().map(|comp| {
+                comp.as_ref().to_string()
+            }).collect::<Option<Vec<String>>>()?;
+
+            let category = path_components.get(0);
+
+            let sub
+
+            // figure out what type of file this is
+
+            // get the parent
+
+            let parent
+
         }
     }
 

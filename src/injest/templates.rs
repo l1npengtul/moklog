@@ -15,6 +15,8 @@ use std::str::pattern::Pattern;
 use std::sync::Arc;
 use tera::Tera;
 use tokio::{fs::File, io::AsyncReadExt};
+use tracing::warn;
+use crate::injest::static_file::process_static_file;
 
 pub struct SiteTheme {
     pub metadata: SiteThemeMetadata,
@@ -25,7 +27,7 @@ pub struct SiteTheme {
     pub testers: Arc<DashMap<String, String>>,
     pub styles: Arc<DashMap<String, String>>,
     pub js_scripts: Arc<DashMap<String, String>>,
-    pub files: Arc<DashMap<String, StaticFile>>,
+    pub files: Arc<DashMap<u64, StaticFile>>,
 }
 
 impl From<SerializeSiteTheme> for SiteTheme {
@@ -54,7 +56,7 @@ struct SerializeSiteTheme {
     pub testers: BTreeMap<String, String>,
     pub styles: BTreeMap<String, String>,
     pub js_scripts: BTreeMap<String, String>,
-    pub files: BTreeMap<String, StaticFile>,
+    pub files: BTreeMap<u64, StaticFile>,
 }
 
 impl From<SiteTheme> for SerializeSiteTheme {
@@ -292,21 +294,13 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     let mut files = DashMap::new();
     for file in walker!(template_dir, "static") {
         let file = file?;
-        if file.metadata()?.len() != 0 {
-            let data = unsafe { Mmap::map(file.path())? };
-            let mut filename = file.into_path();
-            let last = filename.file_name().unwrap().to_str().unwrap_or_default();
-            let (hash, newfname) = new_filename(data.as_ref(), last);
-            let filename = filename.with_file_name(newfname);
-            let new_filename = path_relativizie(file, filename)?;
-            files.insert(
-                new_filename.clone(),
-                StaticFile {
-                    file_hash: hash,
-                    file_name: new_filename,
-                    path: file.into_path().to_str().unwrap_or_default().to_string(),
-                },
-            )
+        match process_static_file(file) {
+            Some(file) => {
+                files.insert(file.0, file.1);
+            }
+            None => {
+                warn!("failed to hash file!")
+            }
         }
     }
 

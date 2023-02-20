@@ -27,7 +27,7 @@ pathdiff = "0.2.1"
 rayon = "1.5.3"
 itertools = "0.10.5"
 lightningcss = "1.0.0-alpha.38"
-minify-js = "0.4.0"
+minify-js = "0.5.2"
 wasmtime = "5.0.0"
 wasmtime-wasi = "5.0.0"
 tokio-rayon = "2.1.0"
@@ -72,6 +72,7 @@ tree-sitter-sql = "0.0.2"
 tree-sitter-ruby = "0.20.0"
 id_tree = "1.8.0"
 bidirectional-map = "0.1.4"
+language-tags = "0.3.2"
 
 [dependencies.moklog_core]
 path = "moklog_core"
@@ -85,11 +86,11 @@ version = "0.6.1"
 features = ["http2"]
 
 [dependencies.sea-orm]
-version = "0.10.5"
+version = "0.11.0"
 features = ["runtime-tokio-rustls", "sqlx-postgres", "macros", "with-json", "with-chrono"]
 
 [dependencies.moka]
-version = "0.9.6"
+version = "0.10.0"
 features = ["future"]
 
 [dependencies.serde]
