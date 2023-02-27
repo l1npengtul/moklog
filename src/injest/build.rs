@@ -5,8 +5,7 @@ use crate::injest::{
 };
 use bidirectional_map::Bimap;
 use color_eyre::{Report, Result};
-use id_tree::InsertBehavior::{AsRoot, UnderNode};
-use id_tree::{Node, NodeId, RemoveBehavior, Tree};
+use id_tree::{InsertBehavior, Node, RemoveBehavior, Tree};
 use ignore::WalkBuilder;
 use itertools::Itertools;
 use memmap2::MmapOptions;
@@ -17,16 +16,31 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, path::Path, str::FromStr};
-use std::ffi::OsStr;
+use std::collections::HashSet;
 use std::str::from_utf8;
-use std::sync::Arc;
 use axum::body::HttpBody;
-use dashmap::DashMap;
+use chrono::{DateTime, Utc};
 use language_tags::LanguageTag;
 use tera::{Context, Filter, Function, Tera};
 use tera::{Test, Value};
 use tracing::log::{error, log, warn};
-use crate::injest::static_file::{new_filename, process_static_file};
+use crate::injest::static_file::{process_static_file};
+
+#[derive(Clone, Debug, PartialOrd, PartialEq, Serialize, Deserialize)]
+pub struct BuildInformation {
+    pub initiated: String,
+    pub id: u64,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub status: BuildStatus,
+}
+
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BuildStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
 
 struct Empty {}
 
@@ -214,6 +228,7 @@ pub enum LeafPathType {
 
 pub struct LeafPath<T> where T: AsRef<[u8]> {
     file_name: String,
+    depth: usize,
     data: Option<LeafPathData<T>>
 }
 
@@ -252,7 +267,7 @@ pub struct FilePath {
     is_file: bool,
 }
 
-const RESERVED_NAMES: &[&str] = &["template", "files", "static", "admin", "user", "me", "api", "stat", "error"];
+const RESERVED_NAMES: &[&str] = &["template", "files", "static", "admin", "user", "me", "api", "stat", "error", "feed"];
 
 const RESERVED_CHARS: &[char] = &[
     '{' , '}' , '|' , '\\' , '^' ,'[' , ']' , '`',
@@ -286,6 +301,7 @@ pub fn build_site(
             RESERVED_NAMES.contains(&f)
         }).unwrap_or(false)
     });
+
     let mut site_tree = Tree::new();
     let mut node_path_store = Bimap::new();
     let mut root_id = None;
@@ -294,22 +310,23 @@ pub fn build_site(
     let mut fs_path_store = Bimap::new();
     let mut fs_root_id = None;
 
-    let mut files = HashMap::new();
+    let mut files = Bimap::new();
+
     for (hash, file) in template.files.iter().map(|x| (*x.key(), x.value().clone())) {
-        files.insert(hash, file);
+        files.insert(hash, file.path);
     }
 
-    let mut site_categories = HashMap::new();
 
     for file in sitebuild_traveller.build() {
+        let depth = file?.depth();
         let file = path_relativizie_path(&site_build_path, file?.into_path())?;
 
         // check if previous exists
         let insert_behaviour = match node_path_store.get(&previous) {
-            Some(node_id) => UnderNode(node_id),
+            Some(node_id) => InsertBehavior::UnderNode(node_id),
             None => {
                 if root_id.is_none() {
-                    AsRoot
+                    InsertBehavior::AsRoot
                 } else {
                     warn!("Orphaned Item Detected!");
                     continue;
@@ -414,11 +431,11 @@ pub fn build_site(
                 return Err(Report::msg("folder reserved word/invalid char!"));
             }
 
-            let leaf_path = LeafPath { file_name: filename.to_string(), data: None };
+            let leaf_path = LeafPath { file_name: filename.to_string(), depth, data: None };
             let node = fs_tree.insert(Node::new(
                 leaf_path
             ), insert_behaviour)?;
-            if insert_behaviour == AsRoot {
+            if insert_behaviour == InsertBehavior::AsRoot {
                 fs_root_id = Some(node.clone());
             }
 
@@ -483,6 +500,9 @@ pub fn build_site(
     }
 
     let mut categories = HashMap::new();
+    let mut category_subcat_map = HashMap::new();
+    let mut sub_categories = HashMap::new();
+
 
     if let Some(fs_rid) = fs_root_id {
         loop {
@@ -503,90 +523,69 @@ pub fn build_site(
             }
         }
 
-        // for reasons we do this horribleness bc i am a shit programmer and i hate performance
-        for depths in 1..=2 {
-            for possible_category in sitebuild_traveller.max_depth(Some(depths)).build() {
-                let possible_category = possible_category?;
-                let path = possible_category.path();
+        for possible_category in sitebuild_traveller.max_depth(Some(2)).build() {
+            let possible_category = possible_category?;
+            let path = possible_category.path();
 
-                if path.is_dir() {
-                    let path_data_id = match fs_path_store.get_rev(path) {
-                        Some(d) => d,
-                        None => continue,
-                    };
+            if path.is_dir() {
+                let path_data_id = match fs_path_store.get_rev(path) {
+                    Some(d) => d,
+                    None => continue,
+                };
 
-                    let path_data = fs_tree.get(path_data_id).unwrap();
+                let path_data = fs_tree.get(path_data_id).unwrap();
 
-                    // parse front matter
+                // parse front matter
 
-                    match &path_data.data().data {
-                        Some(data) => {
-                            let (cfg, _) = match from_utf8(&data.data)?.split_once(SPLITTER) {
-                                Some(v) => v,
+                match &path_data.data().data {
+                    Some(data) => {
+                        let (cfg, _) = match from_utf8(&data.data)?.split_once(SPLITTER) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+
+                        let config = toml::from_str::<ConfigMeta>(cfg)?;
+
+                        if let Some(cat_cfg) = config.category {
+                            let this_dir = match path.file_prefix().map(|x| x.to_str()).flatten() {
+                                Some(pre) => pre,
                                 None => continue,
                             };
-
-                            let config = toml::from_str::<ConfigMeta>(cfg)?;
-
-                            if let Some(cat_cfg) = config.category {
-                                let this_dir = match path.file_prefix().map(|x| x.to_str()).flatten() {
-                                    Some(pre) => pre,
-                                    None => continue,
-                                };
-                                if depths == 1 {
-                                    site_categories.insert(this_dir.to_string(), cat_cfg);
-                                } else {
-                                    let parent = match path_data.parent() {
-                                        Some(p) => p,
+                            {
+                                if possible_category.depth() == 1 {
+                                    categories.insert(this_dir.to_string(), cat_cfg);
+                                    category_subcat_map.insert(this_dir.to_string(), HashSet::new());
+                                } else  {
+                                    let parent = match path.parent().unwrap().file_prefix().map(|x| x.to_str()).flatten() {
+                                        Some(pre) => pre,
                                         None => continue,
                                     };
 
-                                    let path_data = fs_tree.get(path_data_id).unwrap();
-
+                                    if site_categories.contains_key(&parnet) {
+                                        category_subcat_map.get_mut(&parent).unwrap().insert(this_dir.to_string());
+                                        sub_categories.insert(this_dir.to_string(), cat_cfg);
+                                    } else {
+                                        warn!("parent not in!");
+                                    }
                                 }
                             }
-
                         }
-                        None => continue,
                     }
+                    None => continue,
                 }
             }
         }
     }
 
+    for fs_node_id in fs_tree.traverse_level_order_ids(&fs_root_id.unwrap())? {
+        let fs_node = fs_tree.get(&fs_node_id).unwrap();
 
-    if let Some(rid) = root_id {
-        for endpoint_id in site_tree.traverse_pre_order_ids(&rid)? {
-            let endpoint_path = match node_path_store.get_rev(&endpoint_id) {
-                Some(p) => p,
-                None => continue, // TODO: error
-            };
+        if fs_node_id == fs_root_id.unwrap() {
+            let insert_behaviour = InsertBehavior::AsRoot;
 
-            let endpoint = site_tree.get(&endpoint_id).unwrap();
-            let file = from_utf8(&endpoint.data().data)?;
-            let (config, content) = match file.split_once("===") {
-                Some((c, t)) => {
-                    (toml::from_str::<ConfigMeta>(c)?, t)
-                }
-                None => continue,
-            };
-
-            // get the important data: category? subcategory?
-
-            let path_components = endpoint_path.components().map(|comp| {
-                comp.as_ref().to_string()
-            }).collect::<Option<Vec<String>>>()?;
-
-            let category = path_components.get(0);
-
-            let sub
-
-            // figure out what type of file this is
-
-            // get the parent
-
-            let parent
-
+            let materials =
+        } else if fs_node.data().depth == 1 {
+            
         }
     }
 

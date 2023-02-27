@@ -1,159 +1,144 @@
-use chrono::{DateTime, Utc};
+use chrono::{Date, Utc};
 use color_eyre::{Report, Result};
 use once_cell::sync::Lazy;
-use pulldown_cmark::{html, CodeBlockKind, Event, Options, Parser, Tag};
+use pulldown_cmark::{html, CodeBlockKind, Event, Parser, Tag};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap};
-use tera::{Context, Tera};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use bidirectional_map::Bimap;
+use tera::Tera;
+use toml::Value;
 use tracing::log::warn;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+use crate::injest::templates::SiteTheme;
+use tera::Context;
+use crate::injest::build::BuildInformation;
+
+// A root page (index.md) contains a PageMeta + some other Meta
+// A translation page (ko.md, ja.md, es.md, etc etc) contains a some other Meta other than ArticleMeta
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum SiteServe {
-    Cache {
-        size: i32,
-        store: String,
-    },
-    Memory,
-}
-
-impl Default for SiteServe {
-    fn default() -> Self {
-        SiteServe::Cache { size: 25, store: "srv".to_string() }
-    }
+pub struct PageHeader {
+    #[serde(flatten)]
+    pub page: PageMeta,
+    pub page_type: PageTypeMeta,
+    pub custom: Custom,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SiteMeta {
-    pub site_name: String,
-    pub serve: SiteServe,
-    pub categories: Vec<String>,
-    pub rss: bool,
+pub enum PageTypeMeta {
+    SeriesMeta(SeriesMeta),
+    ArticleMeta(ArticleMeta),
+    GenericMeta(GenericMeta),
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Custom {
+    #[serde(flatten)]
+    pub data: BTreeMap<String, Value>
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageMeta {
-    pub title: String,
-    pub author: String,
-    pub rehydrate: i64,
-    pub date: DateTime<Utc>,
-    pub redirects: Vec<String>,
-    pub template: Option<String>,
-    pub tags: Vec<String>,
-    pub lang: Option<String>,
-    pub alt_langs: Option<Vec<String>>,
-    pub min_permission: Option<String>,
-    pub index: bool,
+    pub group: Option<String>,
+    pub translations: BTreeSet<String>,
     pub rss: bool,
+    pub index: bool,
+    pub redirect_from: Vec<String>,
+    pub redirect_to: Option<String>,
+    pub display: String,
+    pub children_template: Option<String>,
+    pub template: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenericMeta {
+    pub date: Date<Utc>,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SeriesMeta {
+    pub on_going: bool,
+    pub date_started: Date<Utc>,
+    pub date_completed: Option<Date<Utc>>,
+    pub edited_dates: Vec<Date<Utc>>,
     pub title: String,
-    pub author: String,
-    pub redirects: Vec<String>,
+    pub authors: Vec<String>,
     pub tags: Vec<String>,
-    pub lang: Option<String>,
-    pub alt_langs: Option<HashMap<String, String>>,
-    pub complete: bool,
-    pub index: bool,
-    pub rss: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CategoryMeta {
-    pub display: String,
-    pub translations: Option<Vec<(String, String)>>,
-    pub default_template: Option<String>,
-    pub include_rss: bool,
-    pub index: bool,
+pub struct ArticleMeta {
+    pub title: String,
+    pub tags: Vec<String>,
+    pub authors: Vec<String>,
+    pub date: Date<Utc>,
+    pub edited_dates: Vec<Date<Utc>>,
+    pub summary: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SeriesData {
-    pub series_name: String,
-    pub base_path: String,
-    pub part: i32,
-    pub parts_names_parts: Vec<(String, String)>,
-}
+// all of this expects a pre-propagated config!
+// page type is exported into the template under "content"
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Children {
-    pub categories: Vec<(String, String)>,
-    pub subcategories: Vec<(String, String)>,
-    pub pages: Vec<(String, String)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WhereTheFuckAreYou {
-    pub pagetype: String,
-    pub path: Vec<String>,
-}
-
-struct TableOfContents<'a> {
-    pub title_text: &'a str,
-    pub level: u32,
-}
-
-pub fn build_page(
-    tera: &Tera,
-    site_meta: &SiteMeta,
-    children: &Children,
-    pagetype: &WhereTheFuckAreYou,
-    series_meta: &Option<SeriesData>,
-    page_meta: &PageMeta,
-    language: Option<&str>,
-    content: &str,
+pub fn build_generic(
+    info: &BuildInformation,
+    theme: &SiteTheme,
+    page: &PageMeta,
+    generic: &GenericMeta,
+    custom: &Custom,
+    content: &str
 ) -> Result<String> {
-    let mut renderer = Parser::new_ext(content, Options::all());
-    let table_of_content = pulldown_cmark_toc::TableOfContents::new(content);
-    let words = words_count::count(content).words;
+    const READING_WPM: f64 = 150.0;
+    let reading_time_seconds = (words_count::count(content).words as f64 / READING_WPM).round() as u32;
 
-    let mut rendered_html = String::new();
-    parser_to_writer(&mut rendered_html, renderer)?;
+    let table_of_contents = pulldown_cmark_toc::TableOfContents::new(content).to_cmark();
 
-    let mut context = Context::new();
-    context.insert("content", &rendered_html);
-    context.insert("title", &page_meta.title);
-    context.insert("tags", &page_meta.tags);
-    context.insert("author", &page_meta.author);
-    context.insert("date", &page_meta.date.date_naive().to_string());
-    context.insert("current_lang", language.unwrap_or_default());
-    context.insert("other_langs", &page_meta.alt_langs.unwrap_or_default());
-    context.insert("toc", &table_of_content.to_cmark());
-    context.insert("min_permission", &page_meta.min_permission);
-    context.insert("indexed", &page_meta.index);
-    context.insert("redirects", &page_meta.redirects);
-    context.insert("rss", &page_meta.rss);
-    context.insert("word_count", &words);
-    context.insert("reading_time_min", &((words as f32/25.0).round() / 10.0));
+    let mut tera_context = Context::new();
 
-    // site
-    context.insert("site.name", &site_meta.site_name);
-    context.insert("site.headers", &site_meta.categories);
-    context.insert("site.rss", &site_meta.rss_link);
+    // populate page data
+    tera_context.insert("page.group", &page.group.unwrap_or("default".into()));
+    tera_context.insert("page.translations", &page.translations);
+    tera_context.insert("page.rss_enabled", &page.rss);
+    tera_context.insert("page.index_enabled", &page.index);
+    tera_context.insert("page.template", &page.template);
+    tera_context.insert("page.children_template", &page.children_template);
+    tera_context.insert("page.display", &page.display);
+    tera_context.insert("page.redirect_from", &page.redirect_from);
+    tera_context.insert("page.redirect_to", &page.redirect_to);
+    tera_context.insert("page.display", &page.display);
+    tera_context.insert("page.type", "generic");
 
-    // children (vaush????)
-    context.insert("children.categories", &children.categories);
-    context.insert("children.pages", &children.pages);
-    context.insert("children.subcategories", &children.subcategories);
+    // populate generic
+    tera_context.insert("content.date", &generic.date);
+    tera_context.insert("content.title", &generic.title);
+    tera_context.insert("content.authors", &generic.authors);
+    tera_context.insert("content.tags", &generic.tags);
 
-    // pagetype
-    context.insert("page.type", &pagetype.pagetype);
-    context.insert("page.path", &pagetype.path);
+    // populate autogenerated data
+    // TODO: moklog information (version, etc)
+    tera_context.insert("auto.reading_time_seconds", &reading_time_seconds);
+    tera_context.insert("auto.table_of_contents", &table_of_contents);
+    tera_context.insert("auto.build_time", &info.start_time);
+    tera_context.insert("auto.build_init", &info.initiated);
+    tera_context.insert("auto.build_id", &info.id);
 
-    if let Some(series_data) = series_meta {
-        context.insert("series.name", &series_data.series_name);
-        context.insert("series.base_path", &series_data.base_path);
-        context.insert("series.current_part", &series_data.part);
-        let (titles, links) = series_data.parts_names_parts.iter().map(|(a, b)|, (a, b)).collect::<(Vec<&String>, Vec<&String>)>();
-        context.insert("series.titles", &titles);
-        context.insert("series.links", &links);
+    // populate custom data
+
+    for (key, value) in custom.data.iter() {
+        let ins_key = format!("custom.{}", key);
+        let tera_value: tera::Value = match value {
+            Value::String(s) => s.into(),
+            Value::Integer(i) => i.into(),
+            Value::Float(f) => f.into(),
+            Value::Boolean(b) => b.into(),
+            Value::Datetime(d) => d.to_string().into(),
+            Value::Array(a) =>
+            Value::Table(_) => {}
+        }
     }
-
-    // template it
-    let rendered = tera.render(&page_meta.template.unwrap_or_default(), &context)?;
-    Ok(rendered)
 }
 
 struct Code {

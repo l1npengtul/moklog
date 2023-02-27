@@ -28,8 +28,8 @@ rayon = "1.5.3"
 itertools = "0.10.5"
 lightningcss = "1.0.0-alpha.38"
 minify-js = "0.5.2"
-wasmtime = "5.0.0"
-wasmtime-wasi = "5.0.0"
+wasmtime = "6.0.0"
+wasmtime-wasi = "6.0.0"
 tokio-rayon = "2.1.0"
 tera = "1.17.1"
 pulldown-cmark-toc = "0.1.1"
@@ -73,6 +73,7 @@ tree-sitter-ruby = "0.20.0"
 id_tree = "1.8.0"
 bidirectional-map = "0.1.4"
 language-tags = "0.3.2"
+upon = "0.6.0"
 
 [dependencies.moklog_core]
 path = "moklog_core"
@@ -109,7 +110,7 @@ version = "0.4.23"
 features = ["serde"]
 
 [dependencies.rhai]
-version = "1.11.0"
+version = "1.12.0"
 features = ["sync"]
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
