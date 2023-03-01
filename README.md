@@ -1,5 +1,3 @@
-# gumilgi
+# moklog
 
-거미: Spider, 일기: Journal
-
-l1npengtul's blogging software with WASM.
+l1npengtul's blogging software with WASM plugins and 2 teir templating. 
