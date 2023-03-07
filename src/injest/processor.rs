@@ -1,11 +1,18 @@
-use crate::injest::static_file::StaticFile;
+use crate::injest::static_file::new_filename;
 use color_eyre::Result;
 use dashmap::DashMap;
 use lol_html::html_content::{Element, TextType};
 use lol_html::{element, rewrite_str, text, HtmlRewriter, Settings};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use crate::mmap_load;
+
+pub fn title_make_url_safe(title: &str) -> String {
+    let mut no_whitespace = title.replace(" ", "-");
+    url_escape::encode(&no_whitespace, &url_escape::PATH).to_string()
+}
 
 pub struct DocumentStatistics {
     pub characters: u64,
@@ -35,7 +42,7 @@ pub fn static_file_rewriter(
 
 fn static_file_rewrite_element(
     path: &str,
-    files: Arc<DashMap<String, String>>,
+    files: Arc<DashMap<u64, PathBuf>>,
     element: &mut Element,
 ) {
     let (da_linkie, attr) = match (element.get_attribute("href"), element.get_attribute("src")) {
@@ -48,20 +55,16 @@ fn static_file_rewrite_element(
         return;
     }
 
-    let file = match if da_linkie.starts_with("/") {
-        files.get(da_linkie.strip_prefix("/").unwrap_or_default())
-    } else {
-        if path.ends_with("/") {
-            files.get(&format!("{path}{href}"))
-        } else {
-            files.get(&format!("{path}/{href}"))
-        }
-    } {
-        Some(s) => s,
+    let file_read = mmap_load!(&da_linkie);
+
+    let (_, filename) = match new_filename(file_read, &da_linkie) {
+        Some(h) => h,
         None => return,
     };
 
-    element.set_attribute(attr, &file.file_name).unwrap();
+    let filename = format!("/{filename}");
+
+    element.set_attribute(attr, &filename).unwrap();
 }
 
 pub struct ProcessedDocument {
@@ -71,7 +74,7 @@ pub struct ProcessedDocument {
 
 pub fn html_post_processor(
     path: &str,
-    files: Arc<DashMap<String, String>>,
+    files: Arc<DashMap<u64, PathBuf>>,
     data_in: &str,
 ) -> Result<ProcessedDocument> {
     let character_count = AtomicU64::new(0);

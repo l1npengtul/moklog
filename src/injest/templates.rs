@@ -1,6 +1,6 @@
 use crate::injest::{
     path_relativizie,
-    static_file::{new_filename, StaticFile},
+    static_file::{StaticFile},
     stylesheet::{compile_sass, optimize_css},
 };
 use color_eyre::Result;
@@ -17,6 +17,7 @@ use tera::Tera;
 use tokio::{fs::File, io::AsyncReadExt};
 use tracing::warn;
 use crate::injest::static_file::process_static_file;
+use crate::{mmap_load, walker};
 
 pub struct SiteTheme {
     pub metadata: SiteThemeMetadata,
@@ -67,6 +68,7 @@ impl From<SiteTheme> for SerializeSiteTheme {
             shortcode: st.shortcode.into_iter().collect(),
             functions: st.functions.into_iter().collect(),
             filters: st.filters.into_iter().collect(),
+            testers: Default::default(),
             styles: st.styles.into_iter().collect(),
             js_scripts: st.js_scripts.into_iter().collect(),
             files: st.files.into_iter().collect(),
@@ -87,14 +89,6 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         ($path:expr) => {
             format!("{template_dir}/{}", $path)
         };
-    }
-    macro_rules! walker {
-        ($dir:expr, $path:expr) => {{
-            WalkBuilder::new(template_dir!($dir, $path))
-                .ignore(true)
-                .add_custom_ignore_filename(".gmignore")
-                .build()
-        }};
     }
 
     // template metadata
@@ -183,6 +177,7 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
     // minify JS
 
     let mut js_scripts = DashMap::new();
+    let session = minify_js::Session::new();
     for script_entry in walker!(template_dir, "scripts") {
         let script_entry = script_entry?;
         let file_extension = script_entry
@@ -198,13 +193,9 @@ pub async fn build_site_theme(template_dir: impl AsRef<str>) -> Result<SiteTheme
         let file_name =
             path_relativizie(template_dir!(template_dir, "scripts"), script_entry.path())?;
         if file_extension == "js" {
-            let mut load = Vec::with_capacity(file_length);
-            File::open(script_entry.path())
-                .await?
-                .read_to_end(&mut load)
-                .await?;
+            let reader = mmap_load!(script_entry.path());
             let mut out = Vec::new();
-            minify_js::minify(TopLevelMode::Global, load, &mut out)?;
+            minify_js::minify(&session, TopLevelMode::Global, &reader, &mut out)?;
             js_scripts.insert(file_name, String::from_utf8(out)?);
         }
     }

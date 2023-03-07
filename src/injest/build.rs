@@ -1,5 +1,4 @@
 use crate::injest::{
-    generate::{CategoryMeta, PageMeta, SeriesMeta, SiteMeta, SubCategoryMeta},
     path_relativizie_path,
     templates::SiteTheme,
 };
@@ -20,11 +19,13 @@ use std::collections::HashSet;
 use std::str::from_utf8;
 use axum::body::HttpBody;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use language_tags::LanguageTag;
 use tera::{Context, Filter, Function, Tera};
 use tera::{Test, Value};
 use tracing::log::{error, log, warn};
 use crate::injest::static_file::{process_static_file};
+use crate::{mmap_load, walker};
 
 #[derive(Clone, Debug, PartialOrd, PartialEq, Serialize, Deserialize)]
 pub struct BuildInformation {
@@ -42,25 +43,6 @@ pub enum BuildStatus {
     Failed,
 }
 
-struct Empty {}
-
-impl AsRef<[u8]> for Empty {
-    fn as_ref(&self) -> &[u8] {
-        const NOTHING: &[u8] = &[];
-        NOTHING
-    }
-}
-
-macro_rules! mmap_load {
-    ($path:expr) => {{
-        let a: Box<impl AsRef<[u8]>> = match unsafe { MmapOptions::new().map(path.as_path()) } {
-            Ok(a) => Box::new(a),
-            Err(_) => Box::new(Empty {}),
-        };
-        a
-    }};
-}
-
 pub enum ConfigurationType {
     Category,
     SubCategory,
@@ -74,16 +56,6 @@ pub enum ConfigurationType {
 pub enum ExternalType {
     InDir,
     Plugin { plugin: String, resource: String },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ConfigMeta {
-    pub external: Option<ExternalType>,
-    #[serde(flatten)]
-    pub page: PageMeta,
-    pub category: Option<CategoryMeta>,
-    pub series: Option<SeriesMeta>,
-    pub redirect: Option<String>,
 }
 
 struct RhaiFilter {
@@ -203,12 +175,6 @@ fn error(out: &str) {
 
 const IGNORES: &'static [&str] = &["build.rhai"];
 
-macro_rules! walker {
-    ($path:expr) => {
-        WalkBuilder::new($path).add_custom_ignore_filename(".mkignore")
-    };
-}
-
 fn file_name_from_path(path: impl AsRef<Path>) -> Option<&str> {
     match path.as_ref().file_name() {
         Some(file) => match file.to_str() {
@@ -296,7 +262,7 @@ pub fn build_site(
     engine.run_ast(&ast);
 
     // traverse site build path
-    let mut sitebuild_traveller = walker!(&site_build_path).filter_entry(|dir| {
+    let mut sitebuild_traveller = walker!(site_build_path.as_ref()).filter_entry(|dir| {
         dir.file_name().to_str().map(|f| {
             RESERVED_NAMES.contains(&f)
         }).unwrap_or(false)
@@ -310,10 +276,10 @@ pub fn build_site(
     let mut fs_path_store = Bimap::new();
     let mut fs_root_id = None;
 
-    let mut files = Bimap::new();
+    let mut files = DashMap::new();
 
     for (hash, file) in template.files.iter().map(|x| (*x.key(), x.value().clone())) {
-        files.insert(hash, file.path);
+        files.insert(hash, path_relativizie_path(&site_build_path, file.path));
     }
 
 
@@ -583,7 +549,7 @@ pub fn build_site(
         if fs_node_id == fs_root_id.unwrap() {
             let insert_behaviour = InsertBehavior::AsRoot;
 
-            let materials =
+            // let materials =
         } else if fs_node.data().depth == 1 {
             
         }

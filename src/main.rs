@@ -20,6 +20,7 @@ mod config;
 mod injest;
 mod models;
 mod plugin;
+mod util;
 
 pub const SITE_CONTENT: &str = "sitecontents";
 pub const SERVE_DIR: &str = "srv";

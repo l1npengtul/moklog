@@ -1,7 +1,9 @@
-use base64::DecodeError;
+use base64::{DecodeError, Engine};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use base64::alphabet::URL_SAFE;
+use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
 use tracing::instrument;
 use color_eyre::Result;
 use memmap2::Mmap;
@@ -31,11 +33,15 @@ pub fn hash_file(file: impl AsRef<[u8]>) -> u64 {
 
 pub fn new_filename(file: impl AsRef<[u8]>, filename: impl AsRef<Path>) -> Option<(u64, String)> {
     let hash = hash_file(file);
-    let base64 = base64::encode(hash.to_le_bytes());
+    let engine = GeneralPurpose::new(
+        &URL_SAFE,
+        GeneralPurposeConfig::new().with_encode_padding(true)
+    );
+    let base64 = engine.encode(hash.to_le_bytes());
     let file_name = filename.as_ref().file_name()?.to_str()?;
     let split = file_name.split_once(".");
     match split {
-        Some((fname, ext)) => Some((hash, format!("{fname}.{base64}.{ext}"))),
+        Some((fname, ext)) => Some((hash, format!("{fname}-{base64}.{ext}"))),
         None => None,
     }
 }
