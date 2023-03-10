@@ -70,6 +70,7 @@ fn static_file_rewrite_element(
 pub struct ProcessedDocument {
     document: String,
     summary: String,
+    full_title: String,
 }
 
 pub fn html_post_processor(

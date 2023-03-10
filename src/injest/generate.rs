@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use bidirectional_map::Bimap;
 use dashmap::DashMap;
+use language_tags::LanguageTag;
 use serde_json::Number;
 use tantivy::HasLen;
 use tera::Tera;
@@ -179,64 +180,82 @@ fn populate_categories_subcategories<'a>(context: &'a mut Context, categories: &
     context.insert("page.categories", &thing);
 }
 
-pub struct GenericBuildStuffs<'a> {
-    tera: &'a Tera,
+fn populate_translations(context: &mut Context, languages: &[&LanguageTag], this_lang: &LanguageTag, default_lang: &LanguageTag, path: &str) {
+    context.insert("page.translations", languages.iter().filter(|x| x == this_lang).filter(|x| x == default_lang).map(|x| {
+        (x.clone().clone(),)
+    }).collect());
+
+    context.insert("page.default_translation", &(default_lang, path));
+    if this_lang == default_lang {
+        context.insert("page.this_translation", &(this_lang, path));
+    } else {
+        context.insert("page.this_translation", &(this_lang,  format!("/{}{path}", this_lang.as_str())));
+    }
 }
 
-pub fn build_generic(
-    tera: &Tera,
-    info: &BuildInformation,
-    page: &PageMeta,
-    generic: &GenericMeta,
-    custom: &Custom,
-    content: &str,
-    path: &str,
+fn populate_core_build_stuffs(context: &mut Context, core: CoreBuildStuffs) {
+    populate_page_meta(context, core.page);
+    populate_counts(context, core.content);
+    context.insert("page.base_slug", core.slug);
+    populate_autos(context, core.info);
+    populate_categories_subcategories(context, &core.categories, &core.subcategories);
+    populate_translations(context, core.langauges, core.language, core.default_language, core.path);
+    tera_context.insert("content.raw", core.content);
+
+    for (key, value) in core.custom.data.iter() {
+        let ins_key = format!("custom.{}", key);
+        context.insert(&ins_key, &value);
+    }
+}
+
+pub struct CoreBuildStuffs<'a> {
+    tera: &'a Tera,
+    info: &'a BuildInformation,
+    page: &'a PageMeta,
+    slug: &'a str,
     files: Arc<DashMap<u64, PathBuf>>,
     categories: Arc<HashMap<String, String>>,
     subcategories: Arc<HashMap<String, HashSet<String>>>,
-    language: &str,
-    other_langauges: &[&str],
+    language: &'a LanguageTag,
+    default_language: &'a LanguageTag,
+    langauges: &'a [&'a LanguageTag],
+    content: &'a str,
+    path: &'a str,
+    custom: &'a Custom,
+}
+
+// TODO: PAM + Permission System
+// Basically like discord: there are users, and there are roles, and those roles have permissions.
+
+// TODO: backfill logic by recursively parent tree, then go forward down the backfills until a consistant thing forms
+pub fn build() {}
+
+pub fn build_generic(
+    generic: &GenericMeta,
+    build_stuffs: CoreBuildStuffs
 ) -> Result<ProcessedDocument> {
     let mut parser = Parser::new(content);
     let mut output = String::with_capacity(content.len());
-
     let mut tera_context = Context::new();
 
-    // populate page data
-    populate_page_meta(&mut tera_context, page);
+    populate_core_build_stuffs(&mut tera_context, build_stuffs);
     tera_context.insert("page.type", "generic");
-
-    // populate generic
-    tera_context.insert("content.raw", &content);
     tera_context.insert("content.date", &generic.date);
     tera_context.insert("content.title", &generic.title);
     tera_context.insert("content.authors", &generic.authors);
     tera_context.insert("content.tags", &generic.tags);
-    populate_counts(&mut tera_context, content);
-
-    populate_autos(&mut tera_context, info);
-
-    populate_categories_subcategories(&mut tera_context, &categories, &subcategories);
-    // populate custom data
-
-    for (key, value) in custom.data.iter() {
-        let ins_key = format!("custom.{}", key);
-        tera_context.insert(&ins_key, &value);
-    }
 
     parser_to_writer(&mut output, parser)?;
     tera_context.insert("content", &output);
-    // insert tera templates
 
+    // insert tera templates
     let mut rendered = String::with_capacity(output.len());
-    tera.render_to("generic.html", &tera_context, &mut rendered)?;
+    build_stuffs.tera.render_to("generic.html", &tera_context, &mut rendered)?;
 
     // html stuffs
 
     Ok(html_post_processor(path, files.clone(), &rendered)?)
 }
-
-
 
 struct Code {
     pub language: String,
